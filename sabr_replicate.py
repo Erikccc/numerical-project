@@ -1,0 +1,1614 @@
+from __future__ import annotations
+
+from dataclasses import dataclass, replace
+import math
+import time
+from typing import Callable, Iterable, Mapping, Sequence
+
+import numpy as np
+import pandas as pd
+
+
+SQRT_2 = math.sqrt(2.0)
+SQRT_2PI = math.sqrt(2.0 * math.pi)
+EPS = 1e-14
+PDF_FLOOR = 1e-300
+
+BenchmarkProvider = Callable[[Mapping[str, float]], float | None]
+
+
+def dummy_benchmark(row: Mapping[str, float]) -> None:
+    """Placeholder benchmark provider for validation workflows."""
+    del row
+    return None
+
+
+table1_benchmark = {
+    (-0.75, 0.2): 0.07910,
+    (-0.5, 0.2): 0.07942,
+    (-0.25, 0.2): 0.07969,
+    (-0.75, 0.4): 0.07860,
+    (-0.75, 0.6): 0.07811,
+}
+
+
+table2_benchmark = {
+    (1.0, 0.2, 0.4): 0.07989,
+    (1.0, 0.2, 0.6): 0.08002,
+    (1.0, 0.2, 0.8): 0.08017,
+    (1.0, 0.4, 0.8): 0.08044,
+    (1.0, 0.8, 0.8): 0.08043,
+    (0.75, 0.2, 0.4): 0.07998,
+    (0.75, 0.2, 0.6): 0.08008,
+    (0.75, 0.2, 0.8): 0.08018,
+    (0.75, 0.4, 0.8): 0.08083,
+    (0.75, 0.8, 0.8): 0.08276,
+    (0.0, 0.2, 0.4): 0.07996,
+    (0.0, 0.2, 0.6): 0.07994,
+    (0.0, 0.2, 0.8): 0.07992,
+    (0.0, 0.4, 0.8): 0.08068,
+    (0.0, 0.8, 0.8): 0.08355,
+}
+
+
+TABLE4_FDM = np.array([0.84255, 0.68906, 0.40646, 0.28502, 0.18304, 0.05343, 0.01096], dtype=float)
+TABLE5_FDM = np.array([0.82886, 0.66959, 0.39772, 0.29118, 0.20690, 0.10018, 0.05014], dtype=float)
+TABLE6_FDM = np.array([0.04559, 0.04141, 0.03942, 0.03750, 0.03390, 0.03061], dtype=float)
+
+TABLE4_ANALYTIC_REFERENCE = {
+    "Hagan": np.array([22.35, 23.64, 17.94, 13.81, 9.38, 2.54, 0.82], dtype=float),
+    "ZC Map": np.array([0.37, 0.51, 1.39, 2.29, 3.20, 4.02, 2.66], dtype=float),
+    "Hyb ZC Map": np.array([4.64, 5.81, 4.07, 2.29, 0.43, -1.26, -0.30], dtype=float),
+}
+
+TABLE5_ANALYTIC_REFERENCE = {
+    "Hagan": np.array([11.65, 15.94, 16.69, 14.67, 12.18, 8.56, 6.88], dtype=float),
+    "ZC Map": np.array([-1.56, -1.57, 0.56, 2.37, 4.02, 5.77, 5.33], dtype=float),
+    "Hyb ZC Map": np.array([3.07, 4.53, 3.86, 2.37, 1.00, -0.10, 0.52], dtype=float),
+}
+
+TABLE6_BASELINE_REFERENCE = {
+    ("Euler", 1.0 / 400.0): {"bias_x1e3": np.array([1.6, 1.5, 1.5, 1.4, 1.3, 1.2], dtype=float), "time_sec": 4.12},
+    ("Euler", 1.0 / 800.0): {"bias_x1e3": np.array([0.7, 0.6, 0.5, 0.5, 0.4, 0.3], dtype=float), "time_sec": 8.26},
+    ("Euler", 1.0 / 1600.0): {"bias_x1e3": np.array([-0.3, -0.3, -0.3, -0.3, -0.3, -0.3], dtype=float), "time_sec": 16.2},
+    ("low-bias", 0.25): {"bias_x1e3": np.array([0.5, 0.5, 0.5, 0.4, 0.4, 0.4], dtype=float), "time_sec": 6.54},
+    ("low-bias", 0.125): {"bias_x1e3": np.array([0.4, 0.4, 0.4, 0.3, 0.3, 0.2], dtype=float), "time_sec": 14.7},
+    ("PSE", 1.0): {"bias_x1e3": np.array([0.1, 0.2, 0.2, 0.2, 0.2, 0.2], dtype=float), "time_sec": 8.19},
+}
+
+TABLE7_PAPER_REFERENCE = [
+    {"n_paths": 160_000, "step": 1.0, "rms_error_x1e3": 3.27, "time_sec": 0.53},
+    {"n_paths": 320_000, "step": 0.5, "rms_error_x1e3": 1.94, "time_sec": 2.27},
+    {"n_paths": 640_000, "step": 0.25, "rms_error_x1e3": 1.21, "time_sec": 9.66},
+    {"n_paths": 1_280_000, "step": 0.125, "rms_error_x1e3": 0.86, "time_sec": 41.35},
+    {"n_paths": 2_560_000, "step": 0.0625, "rms_error_x1e3": 0.59, "time_sec": 279.53},
+]
+
+
+def _norm_pdf(x: np.ndarray) -> np.ndarray:
+    """Standard normal PDF used throughout Proposition 2 and Algorithm 1."""
+    return np.exp(-0.5 * x * x) / SQRT_2PI
+
+
+def _norm_cdf(x: np.ndarray) -> np.ndarray:
+    """Fast vectorized standard normal CDF.
+
+    Uses the Numerical Recipes / A&S-style `erfc` approximation in vectorized
+    NumPy form instead of `np.vectorize(math.erf)`. This is both faster and
+    more numerically stable in the tails, which matters for Proposition 2.
+    """
+    z = np.asarray(x, dtype=float) / SQRT_2
+    t = 1.0 / (1.0 + 0.5 * np.abs(z))
+    tau = t * np.exp(
+        -z * z
+        - 1.26551223
+        + t
+        * (
+            1.00002368
+            + t
+            * (
+                0.37409196
+                + t
+                * (
+                    0.09678418
+                    + t
+                    * (
+                        -0.18628806
+                        + t
+                        * (
+                            0.27886807
+                            + t
+                            * (
+                                -1.13520398
+                                + t
+                                * (
+                                    1.48851587
+                                    + t * (-0.82215223 + t * 0.17087277)
+                                )
+                            )
+                        )
+                    )
+                )
+            )
+        )
+    )
+    erf_z = np.where(z >= 0.0, 1.0 - tau, tau - 1.0)
+    return 0.5 * (1.0 + erf_z)
+
+
+def _safe_ratio(num: np.ndarray, den: np.ndarray, fallback: float | np.ndarray) -> np.ndarray:
+    """Elementwise ratio with a configurable fallback when the denominator is tiny."""
+    out = np.empty_like(num, dtype=float)
+    mask = np.abs(den) > PDF_FLOOR
+    out[mask] = num[mask] / den[mask]
+    out[~mask] = fallback if np.isscalar(fallback) else np.asarray(fallback)[~mask]
+    return out
+
+
+def _correlated_drift_term(
+    sigma_t: np.ndarray,
+    sigma_next: np.ndarray,
+    nu: float,
+    scale: np.ndarray,
+    rho: float,
+) -> np.ndarray:
+    """Stable version of the correlated drift term in Eqs. (7), (15b), and (16b).
+
+    When `nu -> 0`, the volatility path becomes deterministic so `sigma_next - sigma_t`
+    vanishes. The limiting value of this term is therefore zero and should not be
+    evaluated as `0 / 0`.
+    """
+    if abs(nu) < EPS:
+        return np.zeros_like(scale, dtype=float)
+    return rho * (sigma_next - sigma_t) / (nu * scale)
+
+
+def _sln_w_from_skewness(skewness: np.ndarray) -> np.ndarray:
+    """Recover `w = exp(sigma^2) - 1` from skewness using the cubic in Proposition 1."""
+    s2 = np.asarray(skewness, dtype=float) ** 2
+    x = 2.0 * np.cosh(np.arccosh(1.0 + 0.5 * s2) / 3.0)
+    return np.maximum(x - 2.0, 0.0)
+
+
+def _lognormal_shape_stats_from_w(w: np.ndarray) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Return CV, skewness, and ex-kurtosis for a unit-mean lognormal with variance ratio `w`."""
+    w = np.asarray(w, dtype=float)
+    cv = np.sqrt(np.maximum(w, 0.0))
+    skewness = (w + 3.0) * cv
+    ex_kurtosis = w**4 + 6.0 * w**3 + 15.0 * w**2 + 16.0 * w
+    return cv, skewness, ex_kurtosis
+
+
+def _resolve_benchmark(
+    benchmark: BenchmarkProvider | Mapping[object, float] | None,
+    row: Mapping[str, float],
+    keys: Sequence[str],
+) -> float | None:
+    """Resolve a benchmark value from either a callable provider or a keyed mapping."""
+    if benchmark is None:
+        return None
+    if callable(benchmark):
+        return benchmark(row)
+    key = tuple(row[k] for k in keys)
+    return benchmark.get(key)
+
+
+def _martingale_conclusion_from_zscores(z_scores: Sequence[float]) -> str:
+    """Classify martingale deviations as sampling noise or systematic bias."""
+    z = np.abs(np.asarray(z_scores, dtype=float))
+    z = z[np.isfinite(z)]
+    if z.size == 0:
+        return "Monte Carlo noise dominated"
+    if np.all(z < 2.0):
+        return "Monte Carlo noise dominated"
+    if np.sum(z > 3.0) >= max(3, z.size // 2):
+        return "Evidence of systematic bias"
+    return "Monte Carlo noise dominated"
+
+
+def _validation_label(score: int) -> str:
+    if score >= 2:
+        return "PASS"
+    if score == 1:
+        return "WARNING"
+    return "FAIL"
+
+
+@dataclass(frozen=True)
+class SABRParams:
+    f0: float
+    sigma0: float
+    nu: float
+    rho: float
+    beta: float
+
+    @property
+    def beta_star(self) -> float:
+        return 1.0 - self.beta
+
+    @property
+    def rho_star(self) -> float:
+        return math.sqrt(max(0.0, 1.0 - self.rho * self.rho))
+
+
+@dataclass(frozen=True)
+class MonteCarloConfig:
+    maturity: float
+    step: float
+    n_paths: int
+    seed: int = 12345
+
+    @property
+    def n_steps(self) -> int:
+        return int(round(self.maturity / self.step))
+
+
+def sample_sigma_next(
+    sigma_t: np.ndarray, nu: float, h: float, rng: np.random.Generator
+) -> np.ndarray:
+    """Exact volatility step from Eq. (2)."""
+    if abs(nu) < EPS or h <= 0.0:
+        return sigma_t.copy()
+    z = rng.standard_normal(size=sigma_t.shape)
+    return sigma_t * np.exp(nu * math.sqrt(h) * z - 0.5 * nu * nu * h)
+
+
+def conditional_integrated_variance_moments(
+    sigma_t: np.ndarray,
+    sigma_next: np.ndarray,
+    nu: float,
+    h: float,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """Return the first four raw moments of `I_t^h`.
+
+    Implements Proposition 2 in the paper. This is the key moment engine behind
+    Algorithm 1 and is designed to support later replication of Figure 1, Table 1,
+    and Table 2.
+    """
+    sigma_t = np.asarray(sigma_t, dtype=float)
+    sigma_next = np.asarray(sigma_next, dtype=float)
+    hat_nu = nu * math.sqrt(h)
+    small_hat_nu = abs(hat_nu) < 1e-2
+
+    if abs(hat_nu) < EPS:
+        ones = np.ones_like(sigma_t, dtype=float)
+        return ones, ones, ones, ones
+
+    if small_hat_nu:
+        # Appendix A: use the small-hat_nu asymptotics instead of the exact closed form
+        # when cancellation dominates the Proposition 2 formulas numerically.
+        z_hat = np.log(sigma_next / sigma_t) / hat_nu
+        mu1 = np.exp(hat_nu * z_hat)
+        cv = abs(hat_nu) / math.sqrt(3.0)
+        skewness = (6.0 * math.sqrt(3.0) / 5.0) * hat_nu
+        ex_kurtosis = (276.0 / 35.0) * (hat_nu**2)
+
+        var = (mu1 * cv) ** 2
+        mu3_c = skewness * (var ** 1.5)
+        mu4_c = (ex_kurtosis + 3.0) * (var**2)
+
+        mu2_raw = var + mu1 * mu1
+        mu3_raw = mu3_c + 3.0 * mu1 * var + mu1**3
+        mu4_raw = mu4_c + 4.0 * mu1 * mu3_c + 6.0 * mu1 * mu1 * var + mu1**4
+        return mu1, mu2_raw, mu3_raw, mu4_raw
+
+    z_hat = np.log(sigma_next / sigma_t) / hat_nu
+    ratio = sigma_next / sigma_t
+    c = 0.5 * (ratio + 1.0 / ratio)
+
+    def m(k: int) -> np.ndarray:
+        kk = k * hat_nu
+        top = _norm_cdf(z_hat + kk) - _norm_cdf(z_hat - kk)
+        root = np.sqrt(z_hat * z_hat + kk * kk)
+        bot = 2.0 * kk * _norm_pdf(root)
+        top_fallback = 2.0 * kk * _norm_pdf(z_hat)
+        stable_top = np.where(np.abs(top) > PDF_FLOOR, top, top_fallback)
+
+        # Outside the genuine small-hat_nu regime, avoid forcing m_k -> 1 when the
+        # denominator underflows. The central-difference approximation implies
+        # m_k ~ n(z_hat) / n(sqrt(z_hat^2 + (k hat_nu)^2)) = exp((k hat_nu)^2 / 2).
+        conservative_fallback = np.exp(0.5 * kk * kk)
+        return _safe_ratio(stable_top, bot, fallback=conservative_fallback)
+
+    m1 = m(1)
+    m2 = m(2)
+    m3 = m(3)
+    m4 = m(4)
+
+    mu1 = ratio * m1
+    mu2_raw = ratio**2 * (m2 - c * m1) / (hat_nu**2)
+    mu3_raw = ratio**3 * (3.0 * m3 - 8.0 * c * m2 + (4.0 * c * c + 1.0) * m1) / (
+        8.0 * hat_nu**4
+    )
+    mu4_raw = ratio**4 * (
+        2.0 * m4 - 9.0 * c * m3 + (12.0 * c * c + 2.0) * m2 - c * (4.0 * c * c + 3.0) * m1
+    ) / (24.0 * hat_nu**6)
+    return mu1, mu2_raw, mu3_raw, mu4_raw
+
+
+def raw_moments_to_central_stats(
+    mu1: np.ndarray,
+    mu2_raw: np.ndarray,
+    mu3_raw: np.ndarray,
+    mu4_raw: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """Convert raw moments into mean, variance, std, CV, skewness, and ex-kurtosis.
+
+    Implements the statistics defined in Remark 5 after Proposition 2. This helper
+    is public and notebook-friendly for Figure 1 style moment comparisons.
+    """
+    mean = np.asarray(mu1, dtype=float)
+    var = np.maximum(mu2_raw - mean * mean, 0.0)
+    std = np.sqrt(var)
+    cv = _safe_ratio(std, np.maximum(mean, PDF_FLOOR), fallback=0.0)
+
+    centered3 = mu3_raw - 3.0 * mean * mu2_raw + 2.0 * mean**3
+    centered4 = mu4_raw - 4.0 * mean * mu3_raw + 6.0 * mean * mean * mu2_raw - 3.0 * mean**4
+
+    skewness = _safe_ratio(centered3, np.maximum(var * std, PDF_FLOOR), fallback=0.0)
+    ex_kurtosis = _safe_ratio(centered4, np.maximum(var * var, PDF_FLOOR), fallback=3.0) - 3.0
+    return mean, var, std, cv, skewness, ex_kurtosis
+
+
+def moment_statistics_from_raw(
+    mu1: np.ndarray,
+    mu2_raw: np.ndarray,
+    mu3_raw: np.ndarray,
+    mu4_raw: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """Backward-compatible thin wrapper over `raw_moments_to_central_stats`."""
+    _, var, _, cv, skewness, ex_kurtosis = raw_moments_to_central_stats(
+        mu1, mu2_raw, mu3_raw, mu4_raw
+    )
+    return var, cv, skewness, ex_kurtosis
+
+
+def sample_conditional_integrated_variance(
+    sigma_t: np.ndarray,
+    sigma_next: np.ndarray,
+    nu: float,
+    h: float,
+    rng: np.random.Generator,
+) -> np.ndarray:
+    """Sample `I_t^h` with the shifted-lognormal approximation in Algorithm 1 / Eq. (9)."""
+    mu1, mu2_raw, mu3_raw, mu4_raw = conditional_integrated_variance_moments(
+        sigma_t, sigma_next, nu, h
+    )
+    _, _, _, cv, _, _ = raw_moments_to_central_stats(mu1, mu2_raw, mu3_raw, mu4_raw)
+    sigma_sln = np.sqrt(np.log1p((36.0 / 25.0) * cv * cv))
+    x = rng.standard_normal(size=np.asarray(sigma_t).shape)
+    return (mu1 / 6.0) * (1.0 + 5.0 * np.exp(sigma_sln * x - 0.5 * sigma_sln * sigma_sln))
+
+
+def sample_cev_exact(
+    f_bar: np.ndarray,
+    variance_scale: np.ndarray,
+    beta: float,
+    rng: np.random.Generator,
+) -> np.ndarray:
+    """Exact CEV transition sampler from Algorithm 3.
+
+    This implements the shifted-Poisson mixture gamma construction summarized in
+    Proposition 3 and Algorithm 3, and is reused inside Algorithm 4.
+    """
+    beta_star = 1.0 - beta
+    if beta_star <= 0.0:
+        raise ValueError("Exact CEV sampler requires 0 < beta < 1.")
+
+    out = np.zeros_like(f_bar, dtype=float)
+    # When the variance scale is negligible relative to the current level, the
+    # CEV transition is effectively deterministic and should be returned as f_bar.
+    small_variance = variance_scale <= 1e-12 * np.maximum(f_bar * f_bar, 1.0)
+    out[small_variance] = np.maximum(f_bar[small_variance], 0.0)
+
+    alive = (f_bar > 0.0) & (variance_scale > 0.0) & (~small_variance)
+    if not np.any(alive):
+        return np.where(variance_scale <= 0.0, np.maximum(f_bar, 0.0), out)
+
+    alpha = 1.0 / (2.0 * beta_star)
+    z0 = f_bar[alive] ** (2.0 * beta_star) / (beta_star * beta_star * variance_scale[alive])
+
+    x = rng.gamma(shape=alpha, scale=1.0, size=z0.shape)
+    survive = x < 0.5 * z0
+
+    result = np.zeros_like(z0)
+    if np.any(survive):
+        lam = 0.5 * z0[survive] - x[survive]
+        huge_lambda = lam > 1e8
+
+        if np.any(~huge_lambda):
+            pois = rng.poisson(lam[~huge_lambda])
+            zt = 2.0 * rng.gamma(shape=pois + 1.0, scale=1.0)
+            result[np.flatnonzero(survive)[~huge_lambda]] = (
+                beta_star * beta_star * variance_scale[alive][survive][~huge_lambda] * zt
+            ) ** (1.0 / (2.0 * beta_star))
+
+        if np.any(huge_lambda):
+            # Prevent Poisson overflow in the near-deterministic regime.
+            result[np.flatnonzero(survive)[huge_lambda]] = np.maximum(
+                f_bar[alive][survive][huge_lambda], 0.0
+            )
+
+    out[alive] = result
+    out[variance_scale <= 0.0] = np.maximum(f_bar[variance_scale <= 0.0], 0.0)
+    return out
+
+
+def _simulate_terminal_forward_scheme(
+    params: SABRParams,
+    mc: MonteCarloConfig,
+    use_islah: bool = False,
+) -> np.ndarray:
+    """Terminal-price simulator for the SABR model under either the paper scheme or Islah's scheme."""
+    rng = np.random.default_rng(mc.seed)
+    f = np.full(mc.n_paths, params.f0, dtype=float)
+    sigma = np.full(mc.n_paths, params.sigma0, dtype=float)
+
+    beta_star = params.beta_star
+    rho_star_sq = max(0.0, 1.0 - params.rho * params.rho)
+
+    for _ in range(mc.n_steps):
+        absorbed = f <= 0.0
+        sigma_next = sample_sigma_next(sigma, params.nu, mc.step, rng)
+        sigma[absorbed] = sigma_next[absorbed]
+        if np.all(absorbed):
+            continue
+
+        if abs(params.beta) < EPS:
+            raise NotImplementedError(
+                "The beta=0 normal-SABR case is not included in this starter."
+            )
+
+        sigma_alive = sigma[~absorbed]
+        sigma_next_alive = sigma_next[~absorbed]
+        f_alive = f[~absorbed]
+        ih = sample_conditional_integrated_variance(
+            sigma_alive, sigma_next_alive, params.nu, mc.step, rng
+        )
+
+        if beta_star < 1e-8:
+            drift = _correlated_drift_term(
+                sigma_alive,
+                sigma_next_alive,
+                params.nu,
+                np.ones_like(f_alive),
+                params.rho,
+            )
+            mean = f_alive * np.exp(
+                drift - 0.5 * params.rho * params.rho * sigma_alive * sigma_alive * mc.step * ih
+            )
+            z = rng.standard_normal(size=mean.shape)
+            total_var = rho_star_sq * sigma_alive * sigma_alive * mc.step * ih
+            f[~absorbed] = mean * np.exp(np.sqrt(total_var) * z - 0.5 * total_var)
+            sigma = sigma_next
+            continue
+
+        f_pow = np.maximum(f_alive, PDF_FLOOR) ** beta_star
+        drift = _correlated_drift_term(
+            sigma_alive, sigma_next_alive, params.nu, f_pow, params.rho
+        )
+        variance_scale = rho_star_sq * sigma_alive * sigma_alive * mc.step * ih
+
+        if use_islah:
+            beta_prime = params.beta / (1.0 - beta_star * params.rho * params.rho)
+            beta_prime_star = 1.0 - beta_prime
+            islah_shift = beta_star * _correlated_drift_term(
+                sigma_alive,
+                sigma_next_alive,
+                params.nu,
+                np.ones_like(f_alive),
+                params.rho,
+            )
+            transformed_mean = np.abs(
+                (beta_prime_star / beta_star) * (f_pow + islah_shift)
+            ) ** (1.0 / beta_prime_star)
+            if rho_star_sq < EPS:
+                y = transformed_mean
+            else:
+                y = sample_cev_exact(transformed_mean, variance_scale, beta_prime, rng)
+            f_next = ((beta_star / beta_prime_star) * np.maximum(y, 0.0) ** beta_prime_star) ** (
+                1.0 / beta_star
+            )
+        else:
+            f_bar = f_alive * np.exp(
+                drift
+                - 0.5 * params.rho * params.rho * sigma_alive * sigma_alive * mc.step * ih
+                / np.maximum(f_pow * f_pow, PDF_FLOOR)
+            )
+            f_bar = np.maximum(f_bar, 0.0)
+
+            if rho_star_sq < EPS:
+                f_next = f_bar
+            else:
+                f_next = sample_cev_exact(f_bar, variance_scale, params.beta, rng)
+
+        f[~absorbed] = f_next
+        sigma = sigma_next
+
+    return f
+
+
+def simulate_terminal_forward(
+    params: SABRParams,
+    mc: MonteCarloConfig,
+) -> np.ndarray:
+    """Terminal-price simulator for the paper's martingale-preserving CEV approximation."""
+    return _simulate_terminal_forward_scheme(params, mc, use_islah=False)
+
+
+def simulate_terminal_forward_islah(
+    params: SABRParams,
+    mc: MonteCarloConfig,
+) -> np.ndarray:
+    """Terminal-price simulator using the Appendix B Islah-style conditional approximation."""
+    return _simulate_terminal_forward_scheme(params, mc, use_islah=True)
+
+
+def european_call_price(samples: np.ndarray, strike: float) -> float:
+    """Plain Monte Carlo European call price used in the paper's numerical tables."""
+    return float(np.mean(np.maximum(samples - strike, 0.0)))
+
+
+def price_many_strikes(
+    params: SABRParams,
+    mc: MonteCarloConfig,
+    strikes: Sequence[float],
+    terminal_samples: np.ndarray | None = None,
+) -> pd.DataFrame:
+    """Price a batch of European calls for one simulation run.
+
+    Inputs:
+    - params: SABR model parameters.
+    - mc: Monte Carlo configuration for this run.
+    - strikes: iterable of strike values.
+    - terminal_samples: optional precomputed `F_T` samples.
+
+    Output:
+    - DataFrame with columns `strike`, `price`, `mean_terminal`, `n_paths`, `step`, `maturity`.
+    """
+    terminal = simulate_terminal_forward(params, mc) if terminal_samples is None else terminal_samples
+    rows = []
+    mean_terminal = float(np.mean(terminal))
+    for strike in strikes:
+        rows.append(
+            {
+                "strike": float(strike),
+                "price": european_call_price(terminal, float(strike)),
+                "mean_terminal": mean_terminal,
+                "n_paths": mc.n_paths,
+                "step": mc.step,
+                "maturity": mc.maturity,
+            }
+        )
+    return pd.DataFrame(rows)
+
+
+def repeated_pricing(
+    params: SABRParams,
+    mc: MonteCarloConfig,
+    strikes: Sequence[float],
+    n_repeats: int = 50,
+    seed0: int | None = None,
+    benchmark_prices: Mapping[float, float] | None = None,
+    simulator: Callable[[SABRParams, MonteCarloConfig], np.ndarray] | None = None,
+) -> pd.DataFrame:
+    """Repeat pricing runs and aggregate Monte Carlo error statistics.
+
+    Inputs:
+    - params: SABR model parameters.
+    - mc: base Monte Carlo configuration.
+    - strikes: strike grid.
+    - n_repeats: number of independent runs.
+    - seed0: optional seed offset. Uses `mc.seed` when omitted.
+    - benchmark_prices: optional mapping `strike -> benchmark price`.
+    - simulator: optional terminal simulator. Defaults to the paper's main scheme.
+
+    Output:
+    - DataFrame with per-strike aggregated columns:
+      `strike`, `mean_price`, `stdev_price`, `stderr_price`, `bias`,
+      `benchmark_price`, `n_repeats`, `n_paths`, `step`, `maturity`,
+      plus `runtime_sec_mean`.
+    """
+    if seed0 is None:
+        seed0 = mc.seed
+    if simulator is None:
+        simulator = simulate_terminal_forward
+
+    per_run_frames = []
+    runtimes = []
+    for i in range(n_repeats):
+        mc_i = replace(mc, seed=seed0 + i)
+        t0 = time.perf_counter()
+        terminal = simulator(params, mc_i)
+        runtimes.append(time.perf_counter() - t0)
+        frame = price_many_strikes(params, mc_i, strikes, terminal_samples=terminal)
+        frame["repeat"] = i
+        per_run_frames.append(frame)
+
+    all_runs = pd.concat(per_run_frames, ignore_index=True)
+    grouped = all_runs.groupby("strike", as_index=False).agg(
+        mean_price=("price", "mean"),
+        stdev_price=("price", "std"),
+        mean_terminal=("mean_terminal", "mean"),
+        stdev_terminal_estimator=("mean_terminal", "std"),
+    )
+    grouped["stdev_price"] = grouped["stdev_price"].fillna(0.0)
+    grouped["stdev_terminal_estimator"] = grouped["stdev_terminal_estimator"].fillna(0.0)
+    grouped["stderr_price"] = grouped["stdev_price"] / math.sqrt(max(n_repeats, 1))
+    grouped["stderr_terminal_estimator"] = grouped["stdev_terminal_estimator"] / math.sqrt(max(n_repeats, 1))
+    grouped["n_repeats"] = n_repeats
+    grouped["n_paths"] = mc.n_paths
+    grouped["step"] = mc.step
+    grouped["maturity"] = mc.maturity
+    grouped["runtime_sec_mean"] = float(np.mean(runtimes))
+
+    if benchmark_prices is not None:
+        grouped["benchmark_price"] = grouped["strike"].map(benchmark_prices)
+        grouped["bias"] = grouped["mean_price"] - grouped["benchmark_price"]
+        grouped["relative_error"] = grouped["bias"] / grouped["benchmark_price"]
+    else:
+        grouped["benchmark_price"] = np.nan
+        grouped["bias"] = np.nan
+        grouped["relative_error"] = np.nan
+    return grouped
+
+
+def martingale_test(
+    params: SABRParams,
+    maturities: Sequence[float],
+    step: float,
+    n_paths: int = 100_000,
+    seed0: int = 12345,
+    simulator: Callable[[SABRParams, MonteCarloConfig], np.ndarray] | None = None,
+) -> pd.DataFrame:
+    """Run the martingale test `E[F_T] ≈ F_0` across maturities.
+
+    Inputs:
+    - params: SABR model parameters.
+    - maturities: sequence of maturities to test.
+    - step: time step used for each maturity.
+    - n_paths: number of Monte Carlo paths per maturity.
+    - seed0: seed offset.
+    - simulator: optional terminal simulator. Defaults to the paper's main scheme.
+
+    Output:
+    - DataFrame with `maturity`, `mean_terminal`, `std_terminal`, `stderr_terminal`,
+      `martingale_error`, `z_score`, `conclusion`, and `runtime_sec`.
+    """
+    rows = []
+    if simulator is None:
+        simulator = simulate_terminal_forward
+    for i, maturity in enumerate(maturities):
+        mc = MonteCarloConfig(maturity=float(maturity), step=step, n_paths=n_paths, seed=seed0 + i)
+        t0 = time.perf_counter()
+        terminal = simulator(params, mc)
+        runtime_sec = time.perf_counter() - t0
+        mean_terminal = float(np.mean(terminal))
+        std_terminal = float(np.std(terminal, ddof=1))
+        stderr_terminal = float(std_terminal / math.sqrt(len(terminal)))
+        martingale_error = float(mean_terminal - params.f0)
+        rows.append(
+            {
+                "maturity": float(maturity),
+                "mean_terminal": mean_terminal,
+                "std_terminal": std_terminal,
+                "stderr_terminal": stderr_terminal,
+                "martingale_error": martingale_error,
+                "z_score": martingale_error / stderr_terminal if stderr_terminal > 0.0 else np.nan,
+                "runtime_sec": runtime_sec,
+                "step": step,
+                "n_paths": n_paths,
+            }
+        )
+    out = pd.DataFrame(rows)
+    conclusion = _martingale_conclusion_from_zscores(out["z_score"].to_numpy())
+    out["conclusion"] = conclusion
+    return out
+
+
+def summarize_martingale(df: pd.DataFrame) -> dict[str, float | str]:
+    """Aggregate martingale z-scores into a compact validation summary."""
+    abs_z = df["z_score"].abs()
+    return {
+        "mean_abs_z": float(abs_z.mean()),
+        "max_abs_z": float(abs_z.max()),
+        "conclusion": str(df["conclusion"].iloc[0]) if len(df) else "Monte Carlo noise dominated",
+    }
+
+
+def runtime_benchmark(
+    params: SABRParams,
+    configs: Sequence[MonteCarloConfig],
+    strike: float | None = None,
+) -> pd.DataFrame:
+    """Benchmark runtime across a list of Monte Carlo configurations.
+
+    Inputs:
+    - params: SABR model parameters.
+    - configs: sequence of MonteCarloConfig objects.
+    - strike: optional strike to price alongside runtime.
+
+    Output:
+    - DataFrame with one row per config and columns including
+      `maturity`, `step`, `n_paths`, `runtime_sec`, `mean_terminal`,
+      and optional `price`.
+    """
+    rows = []
+    for mc in configs:
+        t0 = time.perf_counter()
+        terminal = simulate_terminal_forward(params, mc)
+        runtime_sec = time.perf_counter() - t0
+        row = {
+            "maturity": mc.maturity,
+            "step": mc.step,
+            "n_paths": mc.n_paths,
+            "seed": mc.seed,
+            "runtime_sec": runtime_sec,
+            "mean_terminal": float(np.mean(terminal)),
+        }
+        if strike is not None:
+            row["strike"] = float(strike)
+            row["price"] = european_call_price(terminal, float(strike))
+        rows.append(row)
+    return pd.DataFrame(rows)
+
+
+def figure1_moment_comparison(
+    hat_nu: float = 0.4,
+    z_hat_grid: Sequence[float] | None = None,
+    sigma_t: float = 1.0,
+) -> pd.DataFrame:
+    """Build the Figure 1 moment-comparison dataset.
+
+    Inputs:
+    - hat_nu: paper's `\\hat\\nu = nu * sqrt(h)`.
+    - z_hat_grid: optional grid for `\\hat Z`. Defaults to `np.linspace(-4, 4, 161)`.
+    - sigma_t: initial volatility level used to reconstruct `sigma_{t+h}` from `\\hat Z`.
+
+    Output:
+    - DataFrame with exact and approximation-implied skewness / ex-kurtosis columns:
+      `exact_*`, `ln_*`, `sln_fixed_*`, `sln_exact_*`.
+    """
+    if z_hat_grid is None:
+        z_hat_grid = np.linspace(-4.0, 4.0, 161)
+
+    z_hat = np.asarray(z_hat_grid, dtype=float)
+    sigma_t_arr = np.full_like(z_hat, float(sigma_t))
+    sigma_next = sigma_t_arr * np.exp(hat_nu * z_hat)
+
+    mu1, mu2_raw, mu3_raw, mu4_raw = conditional_integrated_variance_moments(
+        sigma_t_arr, sigma_next, nu=float(hat_nu), h=1.0
+    )
+    _, _, _, cv_exact, skew_exact, exk_exact = raw_moments_to_central_stats(
+        mu1, mu2_raw, mu3_raw, mu4_raw
+    )
+
+    # LN approximation: fit variance only.
+    w_ln = cv_exact**2
+    _, skew_ln, exk_ln = _lognormal_shape_stats_from_w(w_ln)
+
+    # SLN with fixed lambda = 5/6: fit variance through sigma.
+    lambda_fixed = 5.0 / 6.0
+    w_sln_fixed = cv_exact**2 / (lambda_fixed**2)
+    _, skew_sln_fixed, exk_sln_fixed = _lognormal_shape_stats_from_w(w_sln_fixed)
+
+    # SLN with exact lambda: fit sigma to exact skewness, then lambda from CV.
+    w_sln_exact = _sln_w_from_skewness(skew_exact)
+    sqrt_w_exact = np.sqrt(np.maximum(w_sln_exact, 0.0))
+    lambda_exact = _safe_ratio(cv_exact, np.maximum(sqrt_w_exact, PDF_FLOOR), fallback=0.0)
+    _, skew_sln_exact, exk_sln_exact = _lognormal_shape_stats_from_w(w_sln_exact)
+
+    return pd.DataFrame(
+        {
+            "z_hat": z_hat,
+            "hat_nu": hat_nu,
+            "exact_cv": cv_exact,
+            "exact_skewness": skew_exact,
+            "exact_ex_kurtosis": exk_exact,
+            "ln_skewness": skew_ln,
+            "ln_ex_kurtosis": exk_ln,
+            "sln_fixed_lambda": lambda_fixed,
+            "sln_fixed_skewness": skew_sln_fixed,
+            "sln_fixed_ex_kurtosis": exk_sln_fixed,
+            "sln_exact_lambda": lambda_exact,
+            "sln_exact_skewness": skew_sln_exact,
+            "sln_exact_ex_kurtosis": exk_sln_exact,
+        }
+    )
+
+
+def table1_default_cases() -> pd.DataFrame:
+    """Return the paper's Table 1 parameter grid."""
+    return pd.DataFrame(
+        [
+            {"rho": -0.75, "nu": 0.2, "step": 1.0},
+            {"rho": -0.75, "nu": 0.2, "step": 0.5},
+            {"rho": -0.75, "nu": 0.2, "step": 0.25},
+            {"rho": -0.5, "nu": 0.2, "step": 1.0},
+            {"rho": -0.25, "nu": 0.2, "step": 1.0},
+            {"rho": -0.75, "nu": 0.4, "step": 1.0},
+            {"rho": -0.75, "nu": 0.6, "step": 1.0},
+        ]
+    )
+
+
+def run_table1_experiment(
+    n_paths: int = 100_000,
+    n_repeats: int = 50,
+    seed0: int = 12345,
+    strike: float = 1.0,
+    maturity: float = 1.0,
+    f0: float = 1.0,
+    sigma0: float = 0.2,
+    benchmark: BenchmarkProvider | Mapping[object, float] | None = dummy_benchmark,
+) -> pd.DataFrame:
+    """Reproduce the Table 1 experiment scaffold for `beta = 1`.
+
+    Inputs:
+    - n_paths, n_repeats, seed0: Monte Carlo controls.
+    - strike, maturity, f0, sigma0: base market/model inputs from the paper.
+    - benchmark: optional callable or mapping for FDM prices.
+      Mapping keys should be `(rho, nu)` as in the paper because the benchmark
+      does not vary with `step`.
+
+    Output:
+    - DataFrame with per-case Monte Carlo summary statistics and optional relative error.
+    """
+    rows = []
+    for idx, row in table1_default_cases().iterrows():
+        params = SABRParams(f0=f0, sigma0=sigma0, nu=float(row["nu"]), rho=float(row["rho"]), beta=1.0)
+        mc = MonteCarloConfig(
+            maturity=maturity,
+            step=float(row["step"]),
+            n_paths=n_paths,
+            seed=seed0 + idx * n_repeats,
+        )
+        summary = repeated_pricing(
+            params=params,
+            mc=mc,
+            strikes=[strike],
+            n_repeats=n_repeats,
+            seed0=seed0 + idx * n_repeats,
+            benchmark_prices={
+                strike: _resolve_benchmark(benchmark, {"rho": row["rho"], "nu": row["nu"]}, ("rho", "nu"))
+            }
+            if benchmark is not None
+            else None,
+        )
+        out = summary.iloc[0].to_dict()
+        out.update({"rho": float(row["rho"]), "nu": float(row["nu"]), "beta": 1.0})
+        rows.append(out)
+    return pd.DataFrame(rows)
+
+
+def table2_default_cases() -> pd.DataFrame:
+    """Return the paper's Table 2 parameter grid."""
+    rows = []
+    for rho in [1.0, 0.75, 0.0]:
+        for step in [1.0, 0.5, 0.25]:
+            rows.extend(
+                [
+                    {"rho": rho, "nu": 0.2, "beta": 0.4, "step": step},
+                    {"rho": rho, "nu": 0.2, "beta": 0.6, "step": step},
+                    {"rho": rho, "nu": 0.2, "beta": 0.8, "step": step},
+                    {"rho": rho, "nu": 0.4, "beta": 0.8, "step": step},
+                    {"rho": rho, "nu": 0.8, "beta": 0.8, "step": step},
+                ]
+            )
+    return pd.DataFrame(rows)
+
+
+def run_table2_experiment(
+    n_paths: int = 100_000,
+    n_repeats: int = 50,
+    seed0: int = 12345,
+    strike: float = 1.0,
+    maturity: float = 1.0,
+    f0: float = 1.0,
+    sigma0: float = 0.2,
+    benchmark: BenchmarkProvider | Mapping[object, float] | None = dummy_benchmark,
+) -> pd.DataFrame:
+    """Reproduce the Table 2 experiment scaffold for `rho = 1, 0.75, 0`.
+
+    Inputs:
+    - n_paths, n_repeats, seed0: Monte Carlo controls.
+    - strike, maturity, f0, sigma0: base market/model inputs from the paper.
+    - benchmark: optional callable or mapping for FDM prices.
+      Mapping keys should be `(rho, nu, beta)` because the benchmark does not vary with `step`.
+
+    Output:
+    - DataFrame with per-case Monte Carlo summary statistics and optional relative error.
+      This is the scaffold for the paper's error-decomposition table.
+    """
+    rows = []
+    cases = table2_default_cases()
+    for idx, row in cases.iterrows():
+        params = SABRParams(
+            f0=f0,
+            sigma0=sigma0,
+            nu=float(row["nu"]),
+            rho=float(row["rho"]),
+            beta=float(row["beta"]),
+        )
+        mc = MonteCarloConfig(
+            maturity=maturity,
+            step=float(row["step"]),
+            n_paths=n_paths,
+            seed=seed0 + idx * n_repeats,
+        )
+        benchmark_value = _resolve_benchmark(
+            benchmark,
+            {"rho": row["rho"], "nu": row["nu"], "beta": row["beta"]},
+            ("rho", "nu", "beta"),
+        )
+        summary = repeated_pricing(
+            params=params,
+            mc=mc,
+            strikes=[strike],
+            n_repeats=n_repeats,
+            seed0=seed0 + idx * n_repeats,
+            benchmark_prices={strike: benchmark_value} if benchmark_value is not None else None,
+        )
+        out = summary.iloc[0].to_dict()
+        out.update(
+            {
+                "rho": float(row["rho"]),
+                "nu": float(row["nu"]),
+                "beta": float(row["beta"]),
+            }
+        )
+        rows.append(out)
+    return pd.DataFrame(rows)
+
+
+def _case_params(case_name: str, maturity: float | None = None) -> tuple[SABRParams, float]:
+    """Construct SABR parameters for one of the paper's named Table 3 cases."""
+    case = case_table_3()[case_name]
+    maturity_value = float(case["maturity"] if maturity is None else maturity)
+    params = SABRParams(
+        f0=float(case["f0"]),
+        sigma0=float(case["sigma0"]),
+        nu=float(case["nu"]),
+        rho=float(case["rho"]),
+        beta=float(case["beta"]),
+    )
+    return params, maturity_value
+
+
+def _reference_bias_rows(
+    table_name: str,
+    case_name: str,
+    params: SABRParams,
+    strike_ratios: Sequence[float],
+    benchmark_prices: Sequence[float],
+    reference_biases_x1e3: Mapping[str, np.ndarray],
+) -> pd.DataFrame:
+    """Convert paper-reported reference biases into a DataFrame aligned with our Monte Carlo outputs."""
+    strikes = params.f0 * np.asarray(strike_ratios, dtype=float)
+    rows = []
+    for model, biases_x1e3 in reference_biases_x1e3.items():
+        for ratio, strike, benchmark_price, bias_x1e3 in zip(
+            strike_ratios, strikes, benchmark_prices, biases_x1e3, strict=False
+        ):
+            bias = 1e-3 * float(bias_x1e3)
+            rows.append(
+                {
+                    "table": table_name,
+                    "case": case_name,
+                    "model": model,
+                    "source": "paper_reference",
+                    "strike_ratio": float(ratio),
+                    "strike": float(strike),
+                    "benchmark_price": float(benchmark_price),
+                    "mean_price": float(benchmark_price + bias),
+                    "bias": bias,
+                    "bias_x1e3": float(bias_x1e3),
+                    "stdev_price": np.nan,
+                    "stderr_price": np.nan,
+                    "runtime_sec_mean": np.nan,
+                    "step": np.nan,
+                    "maturity": np.nan,
+                    "n_paths": np.nan,
+                    "n_repeats": np.nan,
+                }
+            )
+    return pd.DataFrame(rows)
+
+
+def _paper_scale_setups(
+    base_setups: Sequence[Mapping[str, float]],
+    n_paths_override: int | None = None,
+) -> list[dict[str, float]]:
+    """Optionally scale a list of paper-reference Monte Carlo setups to a different path budget."""
+    setups = [dict(item) for item in base_setups]
+    if n_paths_override is None or not setups:
+        return setups
+
+    base_paths = int(setups[0]["n_paths"])
+    scale = float(n_paths_override) / float(base_paths)
+    for item in setups:
+        item["n_paths"] = max(1_000, int(round(item["n_paths"] * scale)))
+    return setups
+
+
+def run_table4_experiment(
+    n_paths: int = 100_000,
+    n_repeats: int = 50,
+    seed0: int = 12345,
+) -> pd.DataFrame:
+    """Reproduce Table 4 for Case I, together with the paper's analytic reference biases."""
+    params, maturity = _case_params("Case I")
+    strike_ratios = [0.2, 0.4, 0.8, 1.0, 1.2, 1.6, 2.0]
+    strikes = [params.f0 * x for x in strike_ratios]
+    benchmark_prices = {strike: price for strike, price in zip(strikes, TABLE4_FDM, strict=False)}
+    rows = []
+
+    for idx, step in enumerate([1.0, 0.25, 0.0625]):
+        mc = MonteCarloConfig(
+            maturity=maturity,
+            step=step,
+            n_paths=n_paths,
+            seed=seed0 + idx * n_repeats,
+        )
+        summary = repeated_pricing(
+            params=params,
+            mc=mc,
+            strikes=strikes,
+            n_repeats=n_repeats,
+            seed0=seed0 + idx * n_repeats,
+            benchmark_prices=benchmark_prices,
+        )
+        summary["table"] = "Table 4"
+        summary["case"] = "Case I"
+        summary["model"] = "Our method"
+        summary["source"] = "simulated"
+        summary["bias_x1e3"] = 1e3 * summary["bias"]
+        summary["strike_ratio"] = summary["strike"] / params.f0
+        rows.append(summary)
+
+    rows.append(
+        _reference_bias_rows(
+            table_name="Table 4",
+            case_name="Case I",
+            params=params,
+            strike_ratios=strike_ratios,
+            benchmark_prices=TABLE4_FDM,
+            reference_biases_x1e3=TABLE4_ANALYTIC_REFERENCE,
+        )
+    )
+    return pd.concat(rows, ignore_index=True)
+
+
+def run_table5_experiment(
+    n_paths: int = 100_000,
+    n_repeats: int = 50,
+    seed0: int = 12345,
+) -> pd.DataFrame:
+    """Reproduce Table 5 for Case II, together with the paper's analytic reference biases."""
+    params, maturity = _case_params("Case II")
+    strike_ratios = [0.2, 0.4, 0.8, 1.0, 1.2, 1.6, 2.0]
+    strikes = [params.f0 * x for x in strike_ratios]
+    benchmark_prices = {strike: price for strike, price in zip(strikes, TABLE5_FDM, strict=False)}
+    rows = []
+
+    for idx, step in enumerate([1.0, 0.25, 0.0625]):
+        mc = MonteCarloConfig(
+            maturity=maturity,
+            step=step,
+            n_paths=n_paths,
+            seed=seed0 + idx * n_repeats,
+        )
+        summary = repeated_pricing(
+            params=params,
+            mc=mc,
+            strikes=strikes,
+            n_repeats=n_repeats,
+            seed0=seed0 + idx * n_repeats,
+            benchmark_prices=benchmark_prices,
+        )
+        summary["table"] = "Table 5"
+        summary["case"] = "Case II"
+        summary["model"] = "Our method"
+        summary["source"] = "simulated"
+        summary["bias_x1e3"] = 1e3 * summary["bias"]
+        summary["strike_ratio"] = summary["strike"] / params.f0
+        rows.append(summary)
+
+    rows.append(
+        _reference_bias_rows(
+            table_name="Table 5",
+            case_name="Case II",
+            params=params,
+            strike_ratios=strike_ratios,
+            benchmark_prices=TABLE5_FDM,
+            reference_biases_x1e3=TABLE5_ANALYTIC_REFERENCE,
+        )
+    )
+    return pd.concat(rows, ignore_index=True)
+
+
+def run_table6_experiment(
+    n_paths: int = 100_000,
+    n_repeats: int = 50,
+    seed0: int = 12345,
+) -> pd.DataFrame:
+    """Reproduce Table 6 for Case III and append the paper's competing-baseline reference rows."""
+    params, maturity = _case_params("Case III")
+    strike_ratios = [0.4, 0.8, 1.0, 1.2, 1.6, 2.0]
+    strikes = [params.f0 * x for x in strike_ratios]
+    benchmark_prices = {strike: price for strike, price in zip(strikes, TABLE6_FDM, strict=False)}
+
+    mc = MonteCarloConfig(maturity=maturity, step=1.0, n_paths=n_paths, seed=seed0)
+    summary = repeated_pricing(
+        params=params,
+        mc=mc,
+        strikes=strikes,
+        n_repeats=n_repeats,
+        seed0=seed0,
+        benchmark_prices=benchmark_prices,
+    )
+    summary["table"] = "Table 6"
+    summary["case"] = "Case III"
+    summary["model"] = "Our method"
+    summary["source"] = "simulated"
+    summary["bias_x1e3"] = 1e3 * summary["bias"]
+    summary["strike_ratio"] = summary["strike"] / params.f0
+
+    rows = [summary]
+    for (model, step), ref in TABLE6_BASELINE_REFERENCE.items():
+        for ratio, strike, benchmark_price, bias_x1e3 in zip(
+            strike_ratios, strikes, TABLE6_FDM, ref["bias_x1e3"], strict=False
+        ):
+            bias = 1e-3 * float(bias_x1e3)
+            rows.append(
+                pd.DataFrame(
+                    [
+                        {
+                            "table": "Table 6",
+                            "case": "Case III",
+                            "model": model,
+                            "source": "paper_reference",
+                            "strike_ratio": float(ratio),
+                            "strike": float(strike),
+                            "benchmark_price": float(benchmark_price),
+                            "mean_price": float(benchmark_price + bias),
+                            "bias": bias,
+                            "bias_x1e3": float(bias_x1e3),
+                            "stdev_price": np.nan,
+                            "stderr_price": np.nan,
+                            "runtime_sec_mean": float(ref["time_sec"]),
+                            "step": float(step),
+                            "maturity": maturity,
+                            "n_paths": np.nan,
+                            "n_repeats": np.nan,
+                        }
+                    ]
+                )
+            )
+    return pd.concat(rows, ignore_index=True)
+
+
+def run_table7_experiment(
+    n_paths_base: int | None = None,
+    n_repeats: int = 5,
+    seed0: int = 12345,
+    benchmark_step: float = 0.03125,
+    benchmark_n_paths: int | None = None,
+    benchmark_repeats: int = 3,
+) -> pd.DataFrame:
+    """Reproduce the Table 7 / Figure 2 convergence study using an internal high-resolution MC benchmark."""
+    params, maturity = _case_params("Case IV")
+    setups = _paper_scale_setups(TABLE7_PAPER_REFERENCE, n_paths_override=n_paths_base)
+    if benchmark_n_paths is None:
+        benchmark_n_paths = max(20_000, 2 * int(setups[0]["n_paths"]))
+
+    strike = params.f0
+    benchmark_summary = repeated_pricing(
+        params=params,
+        mc=MonteCarloConfig(
+            maturity=maturity,
+            step=benchmark_step,
+            n_paths=benchmark_n_paths,
+            seed=seed0 + 9_999,
+        ),
+        strikes=[strike],
+        n_repeats=benchmark_repeats,
+        seed0=seed0 + 9_999,
+    )
+    benchmark_price = float(benchmark_summary["mean_price"].iloc[0])
+
+    rows = []
+    for idx, setup in enumerate(setups):
+        mc = MonteCarloConfig(
+            maturity=maturity,
+            step=float(setup["step"]),
+            n_paths=int(setup["n_paths"]),
+            seed=seed0 + 100 * idx,
+        )
+        summary = repeated_pricing(
+            params=params,
+            mc=mc,
+            strikes=[strike],
+            n_repeats=n_repeats,
+            seed0=seed0 + 100 * idx,
+            benchmark_prices={strike: benchmark_price},
+        )
+        row = summary.iloc[0].to_dict()
+        row.update(
+            {
+                "table": "Table 7",
+                "case": "Case IV",
+                "model": "Our method",
+                "source": "simulated",
+                "benchmark_note": f"internal high-resolution MC (h={benchmark_step:g})",
+                "rms_error": math.sqrt(float(row["bias"]) ** 2 + float(row["stdev_price"]) ** 2),
+            }
+        )
+        row["rms_error_x1e3"] = 1e3 * row["rms_error"]
+        rows.append(row)
+
+    for setup in TABLE7_PAPER_REFERENCE:
+        rows.append(
+            {
+                "table": "Table 7",
+                "case": "Case IV",
+                "model": "Our method (paper reference)",
+                "source": "paper_reference",
+                "benchmark_note": "paper FDM benchmark",
+                "strike": strike,
+                "mean_price": np.nan,
+                "stdev_price": np.nan,
+                "stderr_price": np.nan,
+                "benchmark_price": np.nan,
+                "bias": np.nan,
+                "relative_error": np.nan,
+                "mean_terminal": np.nan,
+                "stdev_terminal_estimator": np.nan,
+                "stderr_terminal_estimator": np.nan,
+                "n_repeats": np.nan,
+                "n_paths": int(setup["n_paths"]),
+                "step": float(setup["step"]),
+                "maturity": maturity,
+                "runtime_sec_mean": float(setup["time_sec"]),
+                "rms_error": 1e-3 * float(setup["rms_error_x1e3"]),
+                "rms_error_x1e3": float(setup["rms_error_x1e3"]),
+            }
+        )
+    return pd.DataFrame(rows)
+
+
+def run_figure3_experiment(
+    n_paths: int = 100_000,
+    n_repeats: int = 2,
+    seed0: int = 12345,
+    benchmark_step: float = 0.25,
+    benchmark_n_paths: int | None = None,
+    benchmark_repeats: int = 2,
+) -> pd.DataFrame:
+    """Build the Figure 3 comparison dataset between the paper scheme and Islah's approximation.
+
+    Since the paper does not tabulate the Case V FDM prices by maturity, this function uses
+    an internal high-resolution Monte Carlo benchmark for the ATM option-price error.
+    """
+    base_case = case_table_3()["Case V"]
+    strike = float(base_case["f0"])
+    rows = []
+
+    for maturity in range(1, 11):
+        params, _ = _case_params("Case V", maturity=float(maturity))
+        if benchmark_n_paths is None:
+            benchmark_n = max(20_000, 2 * n_paths)
+        else:
+            benchmark_n = benchmark_n_paths
+
+        benchmark_summary = repeated_pricing(
+            params=params,
+            mc=MonteCarloConfig(
+                maturity=float(maturity),
+                step=benchmark_step,
+                n_paths=benchmark_n,
+                seed=seed0 + 50_000 + maturity,
+            ),
+            strikes=[strike],
+            n_repeats=benchmark_repeats,
+            seed0=seed0 + 50_000 + maturity,
+        )
+        benchmark_price = float(benchmark_summary["mean_price"].iloc[0])
+
+        configs = [
+            ("Our method", 1.0, simulate_terminal_forward),
+            ("Our method", 0.5, simulate_terminal_forward),
+            ("Islah", 1.0, simulate_terminal_forward_islah),
+            ("Islah", 0.5, simulate_terminal_forward_islah),
+        ]
+        for offset, (model, step, simulator) in enumerate(configs):
+            summary = repeated_pricing(
+                params=params,
+                mc=MonteCarloConfig(
+                    maturity=float(maturity),
+                    step=step,
+                    n_paths=n_paths,
+                    seed=seed0 + 1_000 * maturity + offset * n_repeats,
+                ),
+                strikes=[strike],
+                n_repeats=n_repeats,
+                seed0=seed0 + 1_000 * maturity + offset * n_repeats,
+                benchmark_prices={strike: benchmark_price},
+                simulator=simulator,
+            )
+            row = summary.iloc[0].to_dict()
+            row.update(
+                {
+                    "figure": "Figure 3",
+                    "case": "Case V",
+                    "model": model,
+                    "step": step,
+                    "maturity": float(maturity),
+                    "benchmark_note": f"internal high-resolution MC (h={benchmark_step:g})",
+                }
+            )
+            row["forward_error"] = float(row["mean_terminal"] - params.f0)
+            row["option_error"] = float(row["mean_price"] - benchmark_price)
+            rows.append(row)
+
+    return pd.DataFrame(rows)
+
+
+def figure2_runtime_tradeoff(
+    n_paths_base: int | None = None,
+    n_repeats: int = 5,
+    seed0: int = 12345,
+) -> pd.DataFrame:
+    """Alias for the Table 7 convergence dataset used in Figure 2."""
+    return run_table7_experiment(n_paths_base=n_paths_base, n_repeats=n_repeats, seed0=seed0)
+
+
+def case_table_3() -> dict[str, dict[str, float]]:
+    """Parameter presets copied from Table 3 of the paper."""
+    return {
+        "Case I": {"f0": 1.0, "sigma0": 0.25, "nu": 0.3, "rho": -0.8, "beta": 0.3, "maturity": 10.0},
+        "Case II": {"f0": 1.0, "sigma0": 0.25, "nu": 0.3, "rho": -0.5, "beta": 0.6, "maturity": 10.0},
+        "Case III": {"f0": 0.05, "sigma0": 0.4, "nu": 0.6, "rho": 0.0, "beta": 0.3, "maturity": 1.0},
+        "Case IV": {"f0": 1.1, "sigma0": 0.4, "nu": 0.8, "rho": -0.3, "beta": 0.3, "maturity": 4.0},
+        "Case V": {"f0": 1.1, "sigma0": 0.3, "nu": 0.5, "rho": -0.8, "beta": 0.4, "maturity": 10.0},
+    }
+
+
+def summarize_prices(
+    params: SABRParams,
+    mc: MonteCarloConfig,
+    strikes: Iterable[float],
+) -> list[tuple[float, float]]:
+    """Convenience wrapper for paper-style strike sweeps."""
+    terminal = simulate_terminal_forward(params, mc)
+    return [(float(k), european_call_price(terminal, float(k))) for k in strikes]
+
+
+def validate_table1(df: pd.DataFrame) -> tuple[str, str]:
+    """Validate Table 1 style results against paper-level expectations."""
+    rel = df["relative_error"].dropna().abs() if "relative_error" in df.columns else pd.Series(dtype=float)
+    severity_score = 2
+    messages = []
+    monotonicity_tol_pct = 0.05
+
+    if rel.empty:
+        severity_score = min(severity_score, 1)
+        messages.append("No benchmark provided; relative-error thresholds were skipped.")
+    else:
+        max_rel_pct = 100.0 * float(rel.max())
+        avg_rel_pct = 100.0 * float(rel.mean())
+        if max_rel_pct < 0.3:
+            messages.append(
+                f"All relative errors are below 0.3% (max {max_rel_pct:.4f}%, avg {avg_rel_pct:.4f}%)."
+            )
+        elif max_rel_pct <= 1.0:
+            severity_score = min(severity_score, 1)
+            messages.append(
+                f"Relative errors stay within 1% but exceed 0.3% (max {max_rel_pct:.4f}%, avg {avg_rel_pct:.4f}%)."
+            )
+        else:
+            severity_score = 0
+            messages.append(
+                f"Relative errors exceed 1% (max {max_rel_pct:.4f}%, avg {avg_rel_pct:.4f}%)."
+            )
+
+    material_increase_count = 0
+    severe_increase_count = 0
+    for (rho, nu), grp in df.groupby(["rho", "nu"]):
+        grp = grp.sort_values("step", ascending=False)
+        errs = grp["relative_error"].abs()
+        errs = errs[errs.notna()]
+        if len(errs) >= 2:
+            diffs_pct = 100.0 * np.diff(errs.to_numpy())
+            material_increase_count += int(np.sum(diffs_pct > monotonicity_tol_pct))
+            severe_increase_count += int(np.sum(diffs_pct > 2.0 * monotonicity_tol_pct))
+    if severe_increase_count >= 2:
+        severity_score = min(severity_score, 0)
+        messages.append(
+            "Step-size trend is not broadly consistent; repeated material worsening appears as step decreases."
+        )
+    elif material_increase_count >= 1:
+        severity_score = min(severity_score, 1)
+        messages.append(
+            "Step-size trend is broadly consistent, with small non-monotone fluctuations allowed but at least one material increase observed."
+        )
+    else:
+        messages.append(
+            f"Step-size trend is broadly consistent with decreasing error (tolerance {monotonicity_tol_pct:.2f} percentage points)."
+        )
+
+    return _validation_label(severity_score), " ".join(messages)
+
+
+def validate_table2(df: pd.DataFrame) -> tuple[str, str]:
+    """Validate Table 2 style error decomposition trends."""
+    rel = df["relative_error"].abs() if "relative_error" in df.columns else pd.Series(np.nan, index=df.index)
+    has_benchmark = rel.notna().any()
+    severity_score = 2
+    messages = []
+    monotonicity_tol_pct = 0.05
+
+    if not has_benchmark:
+        severity_score = 1
+        messages.append("No benchmark provided; trend checks based on relative_error were skipped.")
+        return _validation_label(severity_score), " ".join(messages)
+
+    rho_means = df.assign(abs_rel=rel).groupby("rho", as_index=True)["abs_rel"].mean()
+    rho_means_pct = {rho: 100.0 * float(val) for rho, val in rho_means.items()}
+    if 0.0 in rho_means.index and rho_means.loc[0.0] == rho_means.min():
+        messages.append(
+            "Average relative error by rho: "
+            + ", ".join(f"rho={rho:g}: {val:.4f}%" for rho, val in rho_means_pct.items())
+            + ". rho=0 has the smallest average error."
+        )
+    else:
+        severity_score = 0
+        messages.append(
+            "Average relative error by rho: "
+            + ", ".join(f"rho={rho:g}: {val:.4f}%" for rho, val in rho_means_pct.items())
+            + ". rho=0 does not have the smallest average error."
+        )
+
+    rho_order = [0.0, 0.75, 1.0]
+    if all(r in rho_means.index for r in rho_order) and rho_means.loc[0.0] <= rho_means.loc[0.75] <= rho_means.loc[1.0]:
+        messages.append("Average error increases with rho.")
+    else:
+        severity_score = min(severity_score, 1)
+        messages.append("Average error does not increase monotonically with rho.")
+
+    material_increase_count = 0
+    severe_increase_count = 0
+    for (rho, nu, beta), grp in df.assign(abs_rel=rel).groupby(["rho", "nu", "beta"]):
+        grp = grp.sort_values("step", ascending=False)
+        errs = grp["abs_rel"].dropna()
+        if len(errs) >= 2:
+            diffs_pct = 100.0 * np.diff(errs.to_numpy())
+            material_increase_count += int(np.sum(diffs_pct > monotonicity_tol_pct))
+            severe_increase_count += int(np.sum(diffs_pct > 2.0 * monotonicity_tol_pct))
+    if severe_increase_count >= 3:
+        severity_score = min(severity_score, 0)
+        messages.append(
+            "Step-size trend is not broadly consistent; repeated large worsening appears as step decreases."
+        )
+    elif material_increase_count >= 1:
+        severity_score = min(severity_score, 1)
+        messages.append(
+            "Step-size trend is broadly consistent across rho/nu/beta groups, with a few material non-monotone fluctuations."
+        )
+    else:
+        messages.append(
+            f"Step-size trend is broadly consistent with decreasing error across rho/nu/beta groups (tolerance {monotonicity_tol_pct:.2f} percentage points)."
+        )
+
+    return _validation_label(severity_score), " ".join(messages)
+
+
+def run_full_validation(
+    table1_benchmark: BenchmarkProvider | Mapping[object, float] | None = table1_benchmark,
+    table2_benchmark: BenchmarkProvider | Mapping[object, float] | None = table2_benchmark,
+    n_paths_table1: int = 100_000,
+    n_repeats_table1: int = 50,
+    n_paths_table2: int = 100_000,
+    n_repeats_table2: int = 50,
+    martingale_n_paths: int = 100_000,
+    quick_mode: bool = False,
+) -> dict[str, object]:
+    """Run the validation layer on top of the current replication scaffold."""
+    if quick_mode:
+        n_paths_table1 = 5_000
+        n_repeats_table1 = 3
+        n_paths_table2 = 3_000
+        n_repeats_table2 = 2
+        martingale_n_paths = 15_000
+
+    case_v = case_table_3()["Case V"]
+    martingale_params = SABRParams(
+        f0=case_v["f0"],
+        sigma0=case_v["sigma0"],
+        nu=case_v["nu"],
+        rho=case_v["rho"],
+        beta=case_v["beta"],
+    )
+
+    martingale_df = martingale_test(
+        martingale_params,
+        maturities=list(range(1, 11)),
+        step=1.0,
+        n_paths=martingale_n_paths,
+        seed0=101,
+    )
+    martingale_summary = summarize_martingale(martingale_df)
+
+    table1_df = run_table1_experiment(
+        n_paths=n_paths_table1,
+        n_repeats=n_repeats_table1,
+        benchmark=table1_benchmark,
+    )
+    table1_status, table1_expl = validate_table1(table1_df)
+
+    table2_df = run_table2_experiment(
+        n_paths=n_paths_table2,
+        n_repeats=n_repeats_table2,
+        benchmark=table2_benchmark,
+    )
+    table2_status, table2_expl = validate_table2(table2_df)
+
+    overall = "Implementation consistent with paper"
+    if "FAIL" in (table1_status, table2_status) or martingale_summary["conclusion"] != "Monte Carlo noise dominated":
+        overall = "Potential issues detected"
+    replication_line = (
+        "Replication likely successful"
+        if martingale_summary["conclusion"] == "Monte Carlo noise dominated"
+        and table1_status in {"PASS", "WARNING"}
+        and table2_status in {"PASS", "WARNING"}
+        else "Potential systematic issues remain"
+    )
+    if quick_mode and ("FAIL" in (table1_status, table2_status)):
+        replication_line = (
+            "Result may be dominated by Monte Carlo noise; rerun at paper scale before diagnosing systematic issues."
+        )
+    scale_label = "quick smoke test" if quick_mode else "paper-scale validation"
+
+    print("======== SABR REPLICATION VALIDATION ========")
+    print(f"Run mode: {scale_label}")
+    print()
+    print("Martingale test:")
+    print(
+        f"mean |z| = {martingale_summary['mean_abs_z']:.3f}, "
+        f"max |z| = {martingale_summary['max_abs_z']:.3f}, "
+        f"conclusion = {martingale_summary['conclusion']}"
+    )
+    if table1_benchmark is None or table2_benchmark is None:
+        print("WARNING: No benchmark provided -> validation is structural only")
+    print()
+    print("Table 1:")
+    print(table1_status)
+    print(table1_expl)
+    print()
+    print("Table 2:")
+    print(table2_status)
+    print(table2_expl)
+    print()
+    print("Conclusion:")
+    print(f"- {overall}")
+    print(f"- {replication_line}")
+
+    return {
+        "martingale_df": martingale_df,
+        "martingale_summary": martingale_summary,
+        "table1_df": table1_df,
+        "table1_status": table1_status,
+        "table1_explanation": table1_expl,
+        "table2_df": table2_df,
+        "table2_status": table2_status,
+        "table2_explanation": table2_expl,
+        "overall_conclusion": overall,
+        "replication_conclusion": replication_line,
+        "quick_mode": quick_mode,
+        "run_mode": scale_label,
+    }
+
+
+def rerun_paper_scale_validation() -> dict[str, object]:
+    """Convenience helper for a full paper-scale validation run."""
+    return run_full_validation(quick_mode=False)
