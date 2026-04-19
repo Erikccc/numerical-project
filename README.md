@@ -30,10 +30,11 @@ The current scaffold focuses on reproducing the paper's core Monte Carlo machine
 - Figure 2 / Table 7 convergence dataset
 - Figure 3 comparison dataset between the paper scheme and Islah's approximation
 - Paper-reference rows for analytic approximations and legacy Monte Carlo baselines
+- A 2D SABR PDE / finite-difference benchmark solver in `(F, log sigma)` coordinates
+- CLI support for switching benchmark sources with `--benchmark-source paper|fdm|mc|none`
 
 ## What is not implemented yet
 
-- Finite-difference benchmark solver from the paper
 - Direct reimplementation of competing baselines such as Euler, low-bias, PSE, Hagan, ZC Map, or Hyb ZC Map
 - Variance reduction and full performance tuning
 
@@ -43,9 +44,11 @@ Run with any Python that has `numpy` and `pandas` installed:
 
 ```powershell
 python .\run_experiments.py --experiment table1 --paper-scale
+python .\run_experiments.py --experiment table1 --paper-scale --benchmark-source fdm
 python .\run_experiments.py --experiment table4 --paper-scale
-python .\run_experiments.py --experiment figure3 --n-paths 50000 --repeats 5
-python .\run_experiments.py --experiment validate --quick
+python .\run_experiments.py --experiment table7 --n-paths 20000 --repeats 3 --benchmark-source fdm
+python .\run_experiments.py --experiment figure3 --n-paths 50000 --repeats 5 --benchmark-source fdm
+python .\run_experiments.py --experiment validate --quick --benchmark-source fdm
 ```
 
 You can also save any tabular output:
@@ -57,8 +60,11 @@ python .\run_experiments.py --experiment table7 --output-csv .\outputs\table7.cs
 ## Notes
 
 - The paper's formulas were transcribed from the PDF and implemented directly.
-- This is now a stronger reproduction scaffold with direct table/figure entrypoints, but it is still not a finished paper-grade reproduction package.
+- `--benchmark-source paper` uses the tabulated paper benchmarks when they are available.
+- `--benchmark-source fdm` recomputes benchmark prices with the built-in PDE/FDM solver.
+- `table7` / `figure3` fall back to the internal high-resolution Monte Carlo benchmark unless `--benchmark-source fdm` is requested.
+- This is now a stronger reproduction scaffold with direct table/figure entrypoints and a built-in PDE benchmark, but it is still not a finished paper-grade reproduction package.
 - The fastest path from here is:
-  1. add a PDE/FDM benchmark,
-  2. replace paper-reference baseline rows with actual baseline implementations,
-  3. tune variance reduction and runtime for paper-scale sweeps.
+  1. replace paper-reference baseline rows with actual baseline implementations,
+  2. tune variance reduction and runtime for paper-scale sweeps,
+  3. compare the new PDE benchmarks against an independent reference implementation.

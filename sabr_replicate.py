@@ -243,6 +243,396 @@ class MonteCarloConfig:
         return int(round(self.maturity / self.step))
 
 
+@dataclass(frozen=True)
+class FDMConfig:
+    n_f: int = 180
+    n_y: int = 80
+    n_t: int | None = None
+    n_t_per_year: int = 240
+    min_n_t: int = 240
+    theta: float = 0.5
+    f_max: float | None = None
+    y_span: float | None = None
+    sigma_floor: float = 1e-4
+
+    def resolved_n_t(self, maturity: float) -> int:
+        if self.n_t is not None:
+            return int(self.n_t)
+        return max(self.min_n_t, int(math.ceil(self.n_t_per_year * maturity)))
+
+
+def _bounded_divide(x: np.ndarray) -> np.ndarray:
+    """Keep denominators away from zero inside the batched tridiagonal solver."""
+    x = np.asarray(x, dtype=float)
+    signs = np.where(x >= 0.0, 1.0, -1.0)
+    return np.where(np.abs(x) > PDF_FLOOR, x, signs * PDF_FLOOR)
+
+
+def _solve_tridiagonal_batch(
+    lower: np.ndarray,
+    diag: np.ndarray,
+    upper: np.ndarray,
+    rhs: np.ndarray,
+) -> np.ndarray:
+    """Solve a batch of tridiagonal systems with the Thomas algorithm.
+
+    Each input has shape `(batch, n)` where `n` is the system size.
+    """
+    lower = np.asarray(lower, dtype=float)
+    diag = np.asarray(diag, dtype=float)
+    upper = np.asarray(upper, dtype=float)
+    rhs = np.asarray(rhs, dtype=float)
+
+    if rhs.ndim != 2:
+        raise ValueError("rhs must be a 2D array with shape (batch, n)")
+    batch, n = rhs.shape
+    if n == 0:
+        return rhs.copy()
+
+    c_prime = np.zeros_like(rhs)
+    d_prime = np.zeros_like(rhs)
+    solution = np.zeros_like(rhs)
+
+    denom0 = _bounded_divide(diag[:, 0])
+    if n > 1:
+        c_prime[:, 0] = upper[:, 0] / denom0
+    d_prime[:, 0] = rhs[:, 0] / denom0
+
+    for idx in range(1, n):
+        denom = _bounded_divide(diag[:, idx] - lower[:, idx] * c_prime[:, idx - 1])
+        if idx < n - 1:
+            c_prime[:, idx] = upper[:, idx] / denom
+        d_prime[:, idx] = (rhs[:, idx] - lower[:, idx] * d_prime[:, idx - 1]) / denom
+
+    solution[:, -1] = d_prime[:, -1]
+    for idx in range(n - 2, -1, -1):
+        solution[:, idx] = d_prime[:, idx] - c_prime[:, idx] * solution[:, idx + 1]
+    return solution
+
+
+def _default_fmax(params: SABRParams, maturity: float, max_strike: float) -> float:
+    """Heuristic upper F boundary for the PDE grid."""
+    base_level = max(params.f0, max_strike, 1e-6)
+    effective_scale = params.sigma0 * (base_level ** max(params.beta, 0.0)) * math.sqrt(max(maturity, EPS))
+    effective_scale *= 1.0 + 0.5 * params.nu * math.sqrt(max(maturity, 0.0))
+    candidate = max_strike + 12.0 * effective_scale + 2.0 * params.f0
+    return max(4.0 * max(params.f0, max_strike), candidate, max_strike + 1.0)
+
+
+def _default_y_span(params: SABRParams, maturity: float) -> float:
+    """Choose a log-volatility span wide enough for the SABR benchmark cases."""
+    return min(max(2.5, 4.0 * params.nu * math.sqrt(max(maturity, EPS))), 4.5)
+
+
+def _prepare_fdm_environment(
+    params: SABRParams,
+    maturity: float,
+    strikes: Sequence[float],
+    config: FDMConfig | None = None,
+) -> dict[str, object]:
+    """Build the grids and operator coefficients used by the SABR PDE solver."""
+    cfg = FDMConfig() if config is None else config
+    max_strike = float(max(strikes))
+    f_max = _default_fmax(params, maturity, max_strike) if cfg.f_max is None else float(cfg.f_max)
+    y_span = _default_y_span(params, maturity) if cfg.y_span is None else float(cfg.y_span)
+
+    y_center = math.log(max(params.sigma0, cfg.sigma_floor))
+    y_min = math.log(max(cfg.sigma_floor, math.exp(y_center - y_span)))
+    y_max = y_center + y_span
+
+    f_grid = np.linspace(0.0, f_max, cfg.n_f + 1)
+    y_grid = np.linspace(y_min, y_max, cfg.n_y + 1)
+    sigma_grid = np.exp(y_grid)
+    d_f = float(f_grid[1] - f_grid[0])
+    d_y = float(y_grid[1] - y_grid[0])
+    n_t = cfg.resolved_n_t(maturity)
+
+    f_interior = np.maximum(f_grid[1:-1], 0.0)[None, :]
+    sigma_interior = sigma_grid[1:-1][:, None]
+    a_f = 0.5 * sigma_interior * sigma_interior * (f_interior ** (2.0 * params.beta))
+    a_cross = params.rho * params.nu * sigma_interior * (f_interior ** params.beta)
+
+    a_y_lower = 0.5 * params.nu * params.nu / (d_y * d_y) + 0.25 * params.nu * params.nu / d_y
+    a_y_diag = -params.nu * params.nu / (d_y * d_y)
+    a_y_upper = 0.5 * params.nu * params.nu / (d_y * d_y) - 0.25 * params.nu * params.nu / d_y
+
+    return {
+        "config": cfg,
+        "f_grid": f_grid,
+        "y_grid": y_grid,
+        "sigma_grid": sigma_grid,
+        "d_f": d_f,
+        "d_y": d_y,
+        "n_t": n_t,
+        "theta": float(cfg.theta),
+        "a_f": a_f,
+        "a_cross": a_cross,
+        "a_y_lower": float(a_y_lower),
+        "a_y_diag": float(a_y_diag),
+        "a_y_upper": float(a_y_upper),
+        "maturity": float(maturity),
+    }
+
+
+def _apply_pde_boundaries(surface: np.ndarray, f_grid: np.ndarray, strike: float) -> None:
+    """Apply call-option boundary conditions on the `(y, F)` PDE grid in place."""
+    intrinsic = np.maximum(f_grid - strike, 0.0)
+    surface[:, 0] = 0.0
+    surface[:, -1] = float(np.maximum(f_grid[-1] - strike, 0.0))
+    surface[0, :] = intrinsic
+    if surface.shape[0] >= 2:
+        surface[-1, :] = surface[-2, :]
+    surface[0, 0] = 0.0
+    surface[0, -1] = float(np.maximum(f_grid[-1] - strike, 0.0))
+    surface[-1, 0] = 0.0
+    surface[-1, -1] = float(np.maximum(f_grid[-1] - strike, 0.0))
+
+
+def _apply_f_operator(surface: np.ndarray, a_f: np.ndarray, d_f: float) -> np.ndarray:
+    out = np.zeros_like(surface)
+    out[1:-1, 1:-1] = a_f * (
+        surface[1:-1, 2:] - 2.0 * surface[1:-1, 1:-1] + surface[1:-1, :-2]
+    ) / (d_f * d_f)
+    return out
+
+
+def _apply_y_operator(
+    surface: np.ndarray,
+    a_y_lower: float,
+    a_y_diag: float,
+    a_y_upper: float,
+) -> np.ndarray:
+    out = np.zeros_like(surface)
+    out[1:-1, 1:-1] = (
+        a_y_lower * surface[:-2, 1:-1]
+        + a_y_diag * surface[1:-1, 1:-1]
+        + a_y_upper * surface[2:, 1:-1]
+    )
+    return out
+
+
+def _apply_cross_operator(surface: np.ndarray, a_cross: np.ndarray, d_f: float, d_y: float) -> np.ndarray:
+    out = np.zeros_like(surface)
+    out[1:-1, 1:-1] = a_cross * (
+        surface[2:, 2:] - surface[2:, :-2] - surface[:-2, 2:] + surface[:-2, :-2]
+    ) / (4.0 * d_f * d_y)
+    return out
+
+
+def _solve_f_implicit(rhs: np.ndarray, stage_surface: np.ndarray, a_f: np.ndarray, dt_theta: float, d_f: float) -> np.ndarray:
+    alpha = dt_theta * a_f / (d_f * d_f)
+    lower = -alpha.copy()
+    diag = 1.0 + 2.0 * alpha
+    upper = -alpha.copy()
+    lower[:, 0] = 0.0
+    upper[:, -1] = 0.0
+
+    rhs_adj = rhs.copy()
+    rhs_adj[:, 0] += alpha[:, 0] * stage_surface[1:-1, 0]
+    rhs_adj[:, -1] += alpha[:, -1] * stage_surface[1:-1, -1]
+    return _solve_tridiagonal_batch(lower, diag, upper, rhs_adj)
+
+
+def _solve_y_implicit(
+    rhs: np.ndarray,
+    stage_surface: np.ndarray,
+    a_y_lower: float,
+    a_y_diag: float,
+    a_y_upper: float,
+    dt_theta: float,
+) -> np.ndarray:
+    rhs_t = rhs.T.copy()
+    batch, n = rhs_t.shape
+    lower = np.full((batch, n), -dt_theta * a_y_lower, dtype=float)
+    diag = np.full((batch, n), 1.0 - dt_theta * a_y_diag, dtype=float)
+    upper = np.full((batch, n), -dt_theta * a_y_upper, dtype=float)
+    lower[:, 0] = 0.0
+    upper[:, -1] = 0.0
+
+    rhs_t[:, 0] += dt_theta * a_y_lower * stage_surface[0, 1:-1]
+    rhs_t[:, -1] += dt_theta * a_y_upper * stage_surface[-1, 1:-1]
+    return _solve_tridiagonal_batch(lower, diag, upper, rhs_t).T
+
+
+def _bilinear_interpolate(
+    x_grid: np.ndarray,
+    y_grid: np.ndarray,
+    values: np.ndarray,
+    x0: float,
+    y0: float,
+) -> float:
+    """Bilinear interpolation on a tensor grid."""
+    ix = int(np.clip(np.searchsorted(x_grid, x0) - 1, 0, len(x_grid) - 2))
+    iy = int(np.clip(np.searchsorted(y_grid, y0) - 1, 0, len(y_grid) - 2))
+
+    x1, x2 = float(x_grid[ix]), float(x_grid[ix + 1])
+    y1, y2 = float(y_grid[iy]), float(y_grid[iy + 1])
+    q11 = float(values[iy, ix])
+    q12 = float(values[iy + 1, ix])
+    q21 = float(values[iy, ix + 1])
+    q22 = float(values[iy + 1, ix + 1])
+
+    if abs(x2 - x1) < EPS or abs(y2 - y1) < EPS:
+        return q11
+
+    wx = (x0 - x1) / (x2 - x1)
+    wy = (y0 - y1) / (y2 - y1)
+    return (
+        (1.0 - wx) * (1.0 - wy) * q11
+        + (1.0 - wx) * wy * q12
+        + wx * (1.0 - wy) * q21
+        + wx * wy * q22
+    )
+
+
+def finite_difference_call_prices(
+    params: SABRParams,
+    maturity: float,
+    strikes: Sequence[float],
+    config: FDMConfig | None = None,
+) -> pd.DataFrame:
+    """Price European calls with a 2D SABR finite-difference benchmark solver.
+
+    The PDE is solved in `(F, y)` coordinates with `y = log(sigma)` using a
+    Douglas-style ADI splitting with the mixed derivative kept explicit. The
+    returned prices are intended as PDE/FDM
+    benchmarks rather than a production-grade calibration engine.
+    """
+    if maturity <= 0.0:
+        strikes_arr = np.asarray(strikes, dtype=float)
+        return pd.DataFrame(
+            {
+                "strike": strikes_arr,
+                "fdm_price": np.maximum(params.f0 - strikes_arr, 0.0),
+                "maturity": maturity,
+            }
+        )
+
+    env = _prepare_fdm_environment(params, maturity, strikes, config=config)
+    f_grid = env["f_grid"]
+    y_grid = env["y_grid"]
+    d_f = float(env["d_f"])
+    d_y = float(env["d_y"])
+    n_t = int(env["n_t"])
+    theta = float(env["theta"])
+    a_f = env["a_f"]
+    a_cross = env["a_cross"]
+    a_y_lower = float(env["a_y_lower"])
+    a_y_diag = float(env["a_y_diag"])
+    a_y_upper = float(env["a_y_upper"])
+    dt = float(maturity) / n_t
+
+    prices = []
+    y0 = math.log(max(params.sigma0, env["config"].sigma_floor))
+
+    for strike in strikes:
+        payoff = np.maximum(f_grid - float(strike), 0.0)
+        surface = np.tile(payoff[None, :], (len(y_grid), 1))
+        _apply_pde_boundaries(surface, f_grid, float(strike))
+
+        for _ in range(n_t):
+            _apply_pde_boundaries(surface, f_grid, float(strike))
+            a0_surface = _apply_cross_operator(surface, a_cross, d_f, d_y)
+            a1_surface = _apply_f_operator(surface, a_f, d_f)
+            a2_surface = _apply_y_operator(surface, a_y_lower, a_y_diag, a_y_upper)
+
+            y0_surface = surface + dt * (a0_surface + a1_surface + a2_surface)
+            _apply_pde_boundaries(y0_surface, f_grid, float(strike))
+
+            rhs1 = y0_surface[1:-1, 1:-1] - theta * dt * a1_surface[1:-1, 1:-1]
+            y1_interior = _solve_f_implicit(rhs1, y0_surface, a_f, theta * dt, d_f)
+            y1_surface = y0_surface.copy()
+            y1_surface[1:-1, 1:-1] = y1_interior
+            _apply_pde_boundaries(y1_surface, f_grid, float(strike))
+
+            rhs2 = y1_surface[1:-1, 1:-1] - theta * dt * a2_surface[1:-1, 1:-1]
+            y2_interior = _solve_y_implicit(
+                rhs2,
+                y1_surface,
+                a_y_lower,
+                a_y_diag,
+                a_y_upper,
+                theta * dt,
+            )
+            surface = y1_surface.copy()
+            surface[1:-1, 1:-1] = y2_interior
+            _apply_pde_boundaries(surface, f_grid, float(strike))
+
+        price = _bilinear_interpolate(f_grid, y_grid, surface, params.f0, y0)
+        prices.append({"strike": float(strike), "fdm_price": float(price), "maturity": float(maturity)})
+
+    return pd.DataFrame(prices)
+
+
+def finite_difference_call_price(
+    params: SABRParams,
+    maturity: float,
+    strike: float,
+    config: FDMConfig | None = None,
+) -> float:
+    """Single-strike convenience wrapper around `finite_difference_call_prices`."""
+    return float(finite_difference_call_prices(params, maturity, [strike], config=config)["fdm_price"].iloc[0])
+
+
+def fdm_benchmark_prices(
+    params: SABRParams,
+    maturity: float,
+    strikes: Sequence[float],
+    config: FDMConfig | None = None,
+) -> dict[float, float]:
+    """Return a simple `strike -> FDM price` mapping for experiment helpers."""
+    frame = finite_difference_call_prices(params, maturity, strikes, config=config)
+    return {float(row.strike): float(row.fdm_price) for row in frame.itertuples(index=False)}
+
+
+def build_table1_fdm_benchmark(
+    strike: float = 1.0,
+    maturity: float = 1.0,
+    f0: float = 1.0,
+    sigma0: float = 0.2,
+    config: FDMConfig | None = None,
+) -> dict[tuple[float, float], float]:
+    """Compute the Table 1 `(rho, nu) -> FDM price` benchmark map with the PDE solver."""
+    benchmark = {}
+    cases = table1_default_cases().drop_duplicates(subset=["rho", "nu"])
+    for row in cases.itertuples(index=False):
+        params = SABRParams(f0=f0, sigma0=sigma0, nu=float(row.nu), rho=float(row.rho), beta=1.0)
+        benchmark[(float(row.rho), float(row.nu))] = finite_difference_call_price(
+            params,
+            maturity=maturity,
+            strike=strike,
+            config=config,
+        )
+    return benchmark
+
+
+def build_table2_fdm_benchmark(
+    strike: float = 1.0,
+    maturity: float = 1.0,
+    f0: float = 1.0,
+    sigma0: float = 0.2,
+    config: FDMConfig | None = None,
+) -> dict[tuple[float, float, float], float]:
+    """Compute the Table 2 `(rho, nu, beta) -> FDM price` benchmark map with the PDE solver."""
+    benchmark = {}
+    cases = table2_default_cases().drop_duplicates(subset=["rho", "nu", "beta"])
+    for row in cases.itertuples(index=False):
+        params = SABRParams(
+            f0=f0,
+            sigma0=sigma0,
+            nu=float(row.nu),
+            rho=float(row.rho),
+            beta=float(row.beta),
+        )
+        benchmark[(float(row.rho), float(row.nu), float(row.beta))] = finite_difference_call_price(
+            params,
+            maturity=maturity,
+            strike=strike,
+            config=config,
+        )
+    return benchmark
+
+
 def sample_sigma_next(
     sigma_t: np.ndarray, nu: float, h: float, rng: np.random.Generator
 ) -> np.ndarray:
@@ -840,7 +1230,7 @@ def run_table1_experiment(
     maturity: float = 1.0,
     f0: float = 1.0,
     sigma0: float = 0.2,
-    benchmark: BenchmarkProvider | Mapping[object, float] | None = dummy_benchmark,
+    benchmark: BenchmarkProvider | Mapping[object, float] | None = table1_benchmark,
 ) -> pd.DataFrame:
     """Reproduce the Table 1 experiment scaffold for `beta = 1`.
 
@@ -906,7 +1296,7 @@ def run_table2_experiment(
     maturity: float = 1.0,
     f0: float = 1.0,
     sigma0: float = 0.2,
-    benchmark: BenchmarkProvider | Mapping[object, float] | None = dummy_benchmark,
+    benchmark: BenchmarkProvider | Mapping[object, float] | None = table2_benchmark,
 ) -> pd.DataFrame:
     """Reproduce the Table 2 experiment scaffold for `rho = 1, 0.75, 0`.
 
@@ -1035,12 +1425,14 @@ def run_table4_experiment(
     n_paths: int = 100_000,
     n_repeats: int = 50,
     seed0: int = 12345,
+    benchmark_prices: Mapping[float, float] | None = None,
 ) -> pd.DataFrame:
     """Reproduce Table 4 for Case I, together with the paper's analytic reference biases."""
     params, maturity = _case_params("Case I")
     strike_ratios = [0.2, 0.4, 0.8, 1.0, 1.2, 1.6, 2.0]
     strikes = [params.f0 * x for x in strike_ratios]
-    benchmark_prices = {strike: price for strike, price in zip(strikes, TABLE4_FDM, strict=False)}
+    if benchmark_prices is None:
+        benchmark_prices = {strike: price for strike, price in zip(strikes, TABLE4_FDM, strict=False)}
     rows = []
 
     for idx, step in enumerate([1.0, 0.25, 0.0625]):
@@ -1083,12 +1475,14 @@ def run_table5_experiment(
     n_paths: int = 100_000,
     n_repeats: int = 50,
     seed0: int = 12345,
+    benchmark_prices: Mapping[float, float] | None = None,
 ) -> pd.DataFrame:
     """Reproduce Table 5 for Case II, together with the paper's analytic reference biases."""
     params, maturity = _case_params("Case II")
     strike_ratios = [0.2, 0.4, 0.8, 1.0, 1.2, 1.6, 2.0]
     strikes = [params.f0 * x for x in strike_ratios]
-    benchmark_prices = {strike: price for strike, price in zip(strikes, TABLE5_FDM, strict=False)}
+    if benchmark_prices is None:
+        benchmark_prices = {strike: price for strike, price in zip(strikes, TABLE5_FDM, strict=False)}
     rows = []
 
     for idx, step in enumerate([1.0, 0.25, 0.0625]):
@@ -1131,12 +1525,14 @@ def run_table6_experiment(
     n_paths: int = 100_000,
     n_repeats: int = 50,
     seed0: int = 12345,
+    benchmark_prices: Mapping[float, float] | None = None,
 ) -> pd.DataFrame:
     """Reproduce Table 6 for Case III and append the paper's competing-baseline reference rows."""
     params, maturity = _case_params("Case III")
     strike_ratios = [0.4, 0.8, 1.0, 1.2, 1.6, 2.0]
     strikes = [params.f0 * x for x in strike_ratios]
-    benchmark_prices = {strike: price for strike, price in zip(strikes, TABLE6_FDM, strict=False)}
+    if benchmark_prices is None:
+        benchmark_prices = {strike: price for strike, price in zip(strikes, TABLE6_FDM, strict=False)}
 
     mc = MonteCarloConfig(maturity=maturity, step=1.0, n_paths=n_paths, seed=seed0)
     summary = repeated_pricing(
@@ -1195,27 +1591,42 @@ def run_table7_experiment(
     benchmark_step: float = 0.03125,
     benchmark_n_paths: int | None = None,
     benchmark_repeats: int = 3,
+    benchmark_source: str = "mc",
+    fdm_config: FDMConfig | None = None,
 ) -> pd.DataFrame:
-    """Reproduce the Table 7 / Figure 2 convergence study using an internal high-resolution MC benchmark."""
+    """Reproduce the Table 7 / Figure 2 convergence study.
+
+    `benchmark_source="mc"` uses the existing high-resolution Monte Carlo benchmark,
+    while `benchmark_source="fdm"` switches the ATM reference price to the PDE/FDM solver.
+    """
     params, maturity = _case_params("Case IV")
     setups = _paper_scale_setups(TABLE7_PAPER_REFERENCE, n_paths_override=n_paths_base)
-    if benchmark_n_paths is None:
-        benchmark_n_paths = max(20_000, 2 * int(setups[0]["n_paths"]))
-
     strike = params.f0
-    benchmark_summary = repeated_pricing(
-        params=params,
-        mc=MonteCarloConfig(
+    if benchmark_source == "fdm":
+        benchmark_price = finite_difference_call_price(
+            params,
             maturity=maturity,
-            step=benchmark_step,
-            n_paths=benchmark_n_paths,
-            seed=seed0 + 9_999,
-        ),
-        strikes=[strike],
-        n_repeats=benchmark_repeats,
-        seed0=seed0 + 9_999,
-    )
-    benchmark_price = float(benchmark_summary["mean_price"].iloc[0])
+            strike=strike,
+            config=fdm_config,
+        )
+        benchmark_note = "PDE/FDM benchmark"
+    else:
+        if benchmark_n_paths is None:
+            benchmark_n_paths = max(20_000, 2 * int(setups[0]["n_paths"]))
+        benchmark_summary = repeated_pricing(
+            params=params,
+            mc=MonteCarloConfig(
+                maturity=maturity,
+                step=benchmark_step,
+                n_paths=benchmark_n_paths,
+                seed=seed0 + 9_999,
+            ),
+            strikes=[strike],
+            n_repeats=benchmark_repeats,
+            seed0=seed0 + 9_999,
+        )
+        benchmark_price = float(benchmark_summary["mean_price"].iloc[0])
+        benchmark_note = f"internal high-resolution MC (h={benchmark_step:g})"
 
     rows = []
     for idx, setup in enumerate(setups):
@@ -1240,7 +1651,7 @@ def run_table7_experiment(
                 "case": "Case IV",
                 "model": "Our method",
                 "source": "simulated",
-                "benchmark_note": f"internal high-resolution MC (h={benchmark_step:g})",
+                "benchmark_note": benchmark_note,
                 "rms_error": math.sqrt(float(row["bias"]) ** 2 + float(row["stdev_price"]) ** 2),
             }
         )
@@ -1284,11 +1695,13 @@ def run_figure3_experiment(
     benchmark_step: float = 0.25,
     benchmark_n_paths: int | None = None,
     benchmark_repeats: int = 2,
+    benchmark_source: str = "mc",
+    fdm_config: FDMConfig | None = None,
 ) -> pd.DataFrame:
     """Build the Figure 3 comparison dataset between the paper scheme and Islah's approximation.
 
-    Since the paper does not tabulate the Case V FDM prices by maturity, this function uses
-    an internal high-resolution Monte Carlo benchmark for the ATM option-price error.
+    `benchmark_source="mc"` uses the previous high-resolution Monte Carlo ATM benchmark.
+    `benchmark_source="fdm"` switches the ATM option benchmark to the PDE/FDM solver.
     """
     base_case = case_table_3()["Case V"]
     strike = float(base_case["f0"])
@@ -1296,24 +1709,34 @@ def run_figure3_experiment(
 
     for maturity in range(1, 11):
         params, _ = _case_params("Case V", maturity=float(maturity))
-        if benchmark_n_paths is None:
-            benchmark_n = max(20_000, 2 * n_paths)
-        else:
-            benchmark_n = benchmark_n_paths
-
-        benchmark_summary = repeated_pricing(
-            params=params,
-            mc=MonteCarloConfig(
+        if benchmark_source == "fdm":
+            benchmark_price = finite_difference_call_price(
+                params,
                 maturity=float(maturity),
-                step=benchmark_step,
-                n_paths=benchmark_n,
-                seed=seed0 + 50_000 + maturity,
-            ),
-            strikes=[strike],
-            n_repeats=benchmark_repeats,
-            seed0=seed0 + 50_000 + maturity,
-        )
-        benchmark_price = float(benchmark_summary["mean_price"].iloc[0])
+                strike=strike,
+                config=fdm_config,
+            )
+            benchmark_note = "PDE/FDM benchmark"
+        else:
+            if benchmark_n_paths is None:
+                benchmark_n = max(20_000, 2 * n_paths)
+            else:
+                benchmark_n = benchmark_n_paths
+
+            benchmark_summary = repeated_pricing(
+                params=params,
+                mc=MonteCarloConfig(
+                    maturity=float(maturity),
+                    step=benchmark_step,
+                    n_paths=benchmark_n,
+                    seed=seed0 + 50_000 + maturity,
+                ),
+                strikes=[strike],
+                n_repeats=benchmark_repeats,
+                seed0=seed0 + 50_000 + maturity,
+            )
+            benchmark_price = float(benchmark_summary["mean_price"].iloc[0])
+            benchmark_note = f"internal high-resolution MC (h={benchmark_step:g})"
 
         configs = [
             ("Our method", 1.0, simulate_terminal_forward),
@@ -1344,7 +1767,7 @@ def run_figure3_experiment(
                     "model": model,
                     "step": step,
                     "maturity": float(maturity),
-                    "benchmark_note": f"internal high-resolution MC (h={benchmark_step:g})",
+                    "benchmark_note": benchmark_note,
                 }
             )
             row["forward_error"] = float(row["mean_terminal"] - params.f0)
@@ -1358,9 +1781,17 @@ def figure2_runtime_tradeoff(
     n_paths_base: int | None = None,
     n_repeats: int = 5,
     seed0: int = 12345,
+    benchmark_source: str = "mc",
+    fdm_config: FDMConfig | None = None,
 ) -> pd.DataFrame:
     """Alias for the Table 7 convergence dataset used in Figure 2."""
-    return run_table7_experiment(n_paths_base=n_paths_base, n_repeats=n_repeats, seed0=seed0)
+    return run_table7_experiment(
+        n_paths_base=n_paths_base,
+        n_repeats=n_repeats,
+        seed0=seed0,
+        benchmark_source=benchmark_source,
+        fdm_config=fdm_config,
+    )
 
 
 def case_table_3() -> dict[str, dict[str, float]]:

@@ -6,10 +6,14 @@ from pathlib import Path
 import pandas as pd
 
 from sabr_replicate import (
+    FDMConfig,
     MonteCarloConfig,
     SABRParams,
+    build_table1_fdm_benchmark,
+    build_table2_fdm_benchmark,
     case_table_3,
     european_call_price,
+    fdm_benchmark_prices,
     figure1_moment_comparison,
     figure2_runtime_tradeoff,
     martingale_test,
@@ -52,6 +56,28 @@ def _paper_scale_defaults(args: argparse.Namespace) -> None:
         args.repeats = 2
     elif args.experiment == "validate":
         args.quick = False
+
+
+def _default_fdm_config() -> FDMConfig:
+    return FDMConfig()
+
+
+def _strike_benchmark_for_case(case_name: str, strike_ratios: list[float]) -> dict[float, float]:
+    case = case_table_3()[case_name]
+    params = SABRParams(
+        f0=case["f0"],
+        sigma0=case["sigma0"],
+        nu=case["nu"],
+        rho=case["rho"],
+        beta=case["beta"],
+    )
+    strikes = [params.f0 * x for x in strike_ratios]
+    return fdm_benchmark_prices(
+        params=params,
+        maturity=case["maturity"],
+        strikes=strikes,
+        config=_default_fdm_config(),
+    )
 
 
 def run_case_i_starter(n_paths: int, seed: int) -> pd.DataFrame:
@@ -114,6 +140,12 @@ def main() -> int:
     parser.add_argument("--quick", action="store_true")
     parser.add_argument("--hat-nu", type=float, default=0.4)
     parser.add_argument("--output-csv", type=str, default=None)
+    parser.add_argument(
+        "--benchmark-source",
+        choices=["paper", "fdm", "mc", "none"],
+        default="paper",
+        help="Benchmark source: paper tables, PDE/FDM solver, internal high-resolution MC, or none.",
+    )
     args = parser.parse_args()
 
     _paper_scale_defaults(args)
@@ -139,31 +171,100 @@ def main() -> int:
         return 0
 
     if args.experiment == "figure2":
-        df = figure2_runtime_tradeoff(n_paths_base=args.n_paths, n_repeats=args.repeats, seed0=args.seed)
+        if args.benchmark_source == "none":
+            raise ValueError("figure2 requires a benchmark source of 'mc' or 'fdm'.")
+        benchmark_source = "fdm" if args.benchmark_source == "fdm" else "mc"
+        df = figure2_runtime_tradeoff(
+            n_paths_base=args.n_paths,
+            n_repeats=args.repeats,
+            seed0=args.seed,
+            benchmark_source=benchmark_source,
+            fdm_config=_default_fdm_config() if benchmark_source == "fdm" else None,
+        )
         _print_frame(df)
         _maybe_save(df, args.output_csv)
         return 0
 
     if args.experiment == "figure3":
-        df = run_figure3_experiment(n_paths=args.n_paths, n_repeats=args.repeats, seed0=args.seed)
+        if args.benchmark_source == "none":
+            raise ValueError("figure3 requires a benchmark source of 'mc' or 'fdm'.")
+        benchmark_source = "fdm" if args.benchmark_source == "fdm" else "mc"
+        df = run_figure3_experiment(
+            n_paths=args.n_paths,
+            n_repeats=args.repeats,
+            seed0=args.seed,
+            benchmark_source=benchmark_source,
+            fdm_config=_default_fdm_config() if benchmark_source == "fdm" else None,
+        )
         _print_frame(df)
         _maybe_save(df, args.output_csv)
         return 0
 
     if args.experiment == "table1":
-        df = run_table1_experiment(n_paths=args.n_paths, n_repeats=args.repeats, seed0=args.seed)
+        if args.benchmark_source == "fdm":
+            benchmark = build_table1_fdm_benchmark(config=_default_fdm_config())
+        elif args.benchmark_source == "none":
+            benchmark = None
+        elif args.benchmark_source == "paper":
+            benchmark = None
+        else:
+            raise ValueError("table1 benchmark source must be 'paper', 'fdm', or 'none'.")
+        kwargs = {"benchmark": benchmark} if args.benchmark_source != "paper" else {}
+        df = run_table1_experiment(n_paths=args.n_paths, n_repeats=args.repeats, seed0=args.seed, **kwargs)
     elif args.experiment == "table2":
-        df = run_table2_experiment(n_paths=args.n_paths, n_repeats=args.repeats, seed0=args.seed)
+        if args.benchmark_source == "fdm":
+            benchmark = build_table2_fdm_benchmark(config=_default_fdm_config())
+        elif args.benchmark_source == "none":
+            benchmark = None
+        elif args.benchmark_source == "paper":
+            benchmark = None
+        else:
+            raise ValueError("table2 benchmark source must be 'paper', 'fdm', or 'none'.")
+        kwargs = {"benchmark": benchmark} if args.benchmark_source != "paper" else {}
+        df = run_table2_experiment(n_paths=args.n_paths, n_repeats=args.repeats, seed0=args.seed, **kwargs)
     elif args.experiment == "table4":
-        df = run_table4_experiment(n_paths=args.n_paths, n_repeats=args.repeats, seed0=args.seed)
+        kwargs = {}
+        if args.benchmark_source == "fdm":
+            kwargs["benchmark_prices"] = _strike_benchmark_for_case("Case I", [0.2, 0.4, 0.8, 1.0, 1.2, 1.6, 2.0])
+        elif args.benchmark_source == "none":
+            kwargs["benchmark_prices"] = {}
+        df = run_table4_experiment(n_paths=args.n_paths, n_repeats=args.repeats, seed0=args.seed, **kwargs)
     elif args.experiment == "table5":
-        df = run_table5_experiment(n_paths=args.n_paths, n_repeats=args.repeats, seed0=args.seed)
+        kwargs = {}
+        if args.benchmark_source == "fdm":
+            kwargs["benchmark_prices"] = _strike_benchmark_for_case("Case II", [0.2, 0.4, 0.8, 1.0, 1.2, 1.6, 2.0])
+        elif args.benchmark_source == "none":
+            kwargs["benchmark_prices"] = {}
+        df = run_table5_experiment(n_paths=args.n_paths, n_repeats=args.repeats, seed0=args.seed, **kwargs)
     elif args.experiment == "table6":
-        df = run_table6_experiment(n_paths=args.n_paths, n_repeats=args.repeats, seed0=args.seed)
+        kwargs = {}
+        if args.benchmark_source == "fdm":
+            kwargs["benchmark_prices"] = _strike_benchmark_for_case("Case III", [0.4, 0.8, 1.0, 1.2, 1.6, 2.0])
+        elif args.benchmark_source == "none":
+            kwargs["benchmark_prices"] = {}
+        df = run_table6_experiment(n_paths=args.n_paths, n_repeats=args.repeats, seed0=args.seed, **kwargs)
     elif args.experiment == "table7":
-        df = run_table7_experiment(n_paths_base=args.n_paths, n_repeats=args.repeats, seed0=args.seed)
+        if args.benchmark_source == "none":
+            raise ValueError("table7 requires a benchmark source of 'mc' or 'fdm'.")
+        benchmark_source = "fdm" if args.benchmark_source == "fdm" else "mc"
+        df = run_table7_experiment(
+            n_paths_base=args.n_paths,
+            n_repeats=args.repeats,
+            seed0=args.seed,
+            benchmark_source=benchmark_source,
+            fdm_config=_default_fdm_config() if benchmark_source == "fdm" else None,
+        )
     elif args.experiment == "validate":
-        out = run_full_validation(quick_mode=args.quick)
+        kwargs = {"quick_mode": args.quick}
+        if args.benchmark_source == "fdm":
+            kwargs["table1_benchmark"] = build_table1_fdm_benchmark(config=_default_fdm_config())
+            kwargs["table2_benchmark"] = build_table2_fdm_benchmark(config=_default_fdm_config())
+        elif args.benchmark_source == "none":
+            kwargs["table1_benchmark"] = None
+            kwargs["table2_benchmark"] = None
+        elif args.benchmark_source == "mc":
+            raise ValueError("validate benchmark source must be 'paper', 'fdm', or 'none'.")
+        out = run_full_validation(**kwargs)
         for key in ("table1_df", "table2_df", "martingale_df"):
             print(f"\n[{key}]")
             _print_frame(out[key])
