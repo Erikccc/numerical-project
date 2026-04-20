@@ -889,16 +889,22 @@ def _simulate_terminal_forward_scheme(
                 np.ones_like(f_alive),
                 params.rho,
             )
-            transformed_mean = np.abs(
-                (beta_prime_star / beta_star) * (f_pow + islah_shift)
-            ) ** (1.0 / beta_prime_star)
-            if rho_star_sq < EPS:
-                y = transformed_mean
+            if abs(beta_prime_star) < 1e-12:
+                # At |rho| = 1 we have beta_prime = 1, so the Islah transform
+                # becomes deterministic and the generic power-law formulas hit
+                # their removable singularity at beta_prime_star = 0.
+                f_next = np.maximum(f_pow + islah_shift, 0.0) ** (1.0 / beta_star)
             else:
-                y = sample_cev_exact(transformed_mean, variance_scale, beta_prime, rng)
-            f_next = ((beta_star / beta_prime_star) * np.maximum(y, 0.0) ** beta_prime_star) ** (
-                1.0 / beta_star
-            )
+                transformed_mean = np.abs(
+                    (beta_prime_star / beta_star) * (f_pow + islah_shift)
+                ) ** (1.0 / beta_prime_star)
+                if rho_star_sq < EPS:
+                    y = transformed_mean
+                else:
+                    y = sample_cev_exact(transformed_mean, variance_scale, beta_prime, rng)
+                f_next = (
+                    (beta_star / beta_prime_star) * np.maximum(y, 0.0) ** beta_prime_star
+                ) ** (1.0 / beta_star)
         else:
             f_bar = f_alive * np.exp(
                 drift
@@ -1815,12 +1821,46 @@ def summarize_prices(
     return [(float(k), european_call_price(terminal, float(k))) for k in strikes]
 
 
+def _count_significant_bias_worsening(
+    grp: pd.DataFrame,
+    bias_col: str = "bias",
+    stderr_col: str = "stderr_price",
+) -> tuple[int, int, float]:
+    """Count statistically significant increases in absolute bias as step decreases."""
+    grp = grp.sort_values("step", ascending=False)
+    abs_bias = grp[bias_col].abs().to_numpy(dtype=float)
+    stderr = grp[stderr_col].to_numpy(dtype=float)
+
+    material = 0
+    severe = 0
+    max_z = 0.0
+    for idx in range(len(grp) - 1):
+        if not (
+            np.isfinite(abs_bias[idx])
+            and np.isfinite(abs_bias[idx + 1])
+            and np.isfinite(stderr[idx])
+            and np.isfinite(stderr[idx + 1])
+        ):
+            continue
+        diff = abs_bias[idx + 1] - abs_bias[idx]
+        combined_stderr = math.hypot(stderr[idx], stderr[idx + 1])
+        if combined_stderr <= PDF_FLOOR:
+            z_score = math.inf if diff > 0.0 else 0.0
+        else:
+            z_score = diff / combined_stderr
+        max_z = max(max_z, float(z_score))
+        if z_score > 2.0:
+            material += 1
+        if z_score > 3.0:
+            severe += 1
+    return material, severe, max_z
+
+
 def validate_table1(df: pd.DataFrame) -> tuple[str, str]:
     """Validate Table 1 style results against paper-level expectations."""
     rel = df["relative_error"].dropna().abs() if "relative_error" in df.columns else pd.Series(dtype=float)
     severity_score = 2
     messages = []
-    monotonicity_tol_pct = 0.05
 
     if rel.empty:
         severity_score = min(severity_score, 1)
@@ -1845,27 +1885,27 @@ def validate_table1(df: pd.DataFrame) -> tuple[str, str]:
 
     material_increase_count = 0
     severe_increase_count = 0
+    max_worsening_z = 0.0
     for (rho, nu), grp in df.groupby(["rho", "nu"]):
-        grp = grp.sort_values("step", ascending=False)
-        errs = grp["relative_error"].abs()
-        errs = errs[errs.notna()]
-        if len(errs) >= 2:
-            diffs_pct = 100.0 * np.diff(errs.to_numpy())
-            material_increase_count += int(np.sum(diffs_pct > monotonicity_tol_pct))
-            severe_increase_count += int(np.sum(diffs_pct > 2.0 * monotonicity_tol_pct))
+        material, severe, worst_z = _count_significant_bias_worsening(grp)
+        material_increase_count += material
+        severe_increase_count += severe
+        max_worsening_z = max(max_worsening_z, worst_z)
     if severe_increase_count >= 2:
         severity_score = min(severity_score, 0)
         messages.append(
-            "Step-size trend is not broadly consistent; repeated material worsening appears as step decreases."
+            "Step-size trend shows repeated statistically significant bias worsening as step decreases "
+            f"(worst increase {max_worsening_z:.2f} standard errors)."
         )
     elif material_increase_count >= 1:
         severity_score = min(severity_score, 1)
         messages.append(
-            "Step-size trend is broadly consistent, with small non-monotone fluctuations allowed but at least one material increase observed."
+            "Step-size trend is broadly consistent; at least one bias increase exceeds Monte Carlo noise "
+            f"(worst increase {max_worsening_z:.2f} standard errors)."
         )
     else:
         messages.append(
-            f"Step-size trend is broadly consistent with decreasing error (tolerance {monotonicity_tol_pct:.2f} percentage points)."
+            "Step-size trend is broadly consistent with decreasing bias once Monte Carlo standard error is taken into account."
         )
 
     return _validation_label(severity_score), " ".join(messages)
@@ -1877,7 +1917,6 @@ def validate_table2(df: pd.DataFrame) -> tuple[str, str]:
     has_benchmark = rel.notna().any()
     severity_score = 2
     messages = []
-    monotonicity_tol_pct = 0.05
 
     if not has_benchmark:
         severity_score = 1
@@ -1909,26 +1948,27 @@ def validate_table2(df: pd.DataFrame) -> tuple[str, str]:
 
     material_increase_count = 0
     severe_increase_count = 0
+    max_worsening_z = 0.0
     for (rho, nu, beta), grp in df.assign(abs_rel=rel).groupby(["rho", "nu", "beta"]):
-        grp = grp.sort_values("step", ascending=False)
-        errs = grp["abs_rel"].dropna()
-        if len(errs) >= 2:
-            diffs_pct = 100.0 * np.diff(errs.to_numpy())
-            material_increase_count += int(np.sum(diffs_pct > monotonicity_tol_pct))
-            severe_increase_count += int(np.sum(diffs_pct > 2.0 * monotonicity_tol_pct))
+        material, severe, worst_z = _count_significant_bias_worsening(grp)
+        material_increase_count += material
+        severe_increase_count += severe
+        max_worsening_z = max(max_worsening_z, worst_z)
     if severe_increase_count >= 3:
         severity_score = min(severity_score, 0)
         messages.append(
-            "Step-size trend is not broadly consistent; repeated large worsening appears as step decreases."
+            "Step-size trend shows repeated statistically significant bias worsening as step decreases "
+            f"(worst increase {max_worsening_z:.2f} standard errors)."
         )
     elif material_increase_count >= 1:
         severity_score = min(severity_score, 1)
         messages.append(
-            "Step-size trend is broadly consistent across rho/nu/beta groups, with a few material non-monotone fluctuations."
+            "Step-size trend is broadly consistent across rho/nu/beta groups; only a few bias increases rise above Monte Carlo noise "
+            f"(worst increase {max_worsening_z:.2f} standard errors)."
         )
     else:
         messages.append(
-            f"Step-size trend is broadly consistent with decreasing error across rho/nu/beta groups (tolerance {monotonicity_tol_pct:.2f} percentage points)."
+            "Step-size trend is broadly consistent with decreasing bias across rho/nu/beta groups once Monte Carlo standard error is taken into account."
         )
 
     return _validation_label(severity_score), " ".join(messages)

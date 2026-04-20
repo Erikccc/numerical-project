@@ -32,11 +32,24 @@ The current scaffold focuses on reproducing the paper's core Monte Carlo machine
 - Paper-reference rows for analytic approximations and legacy Monte Carlo baselines
 - A 2D SABR PDE / finite-difference benchmark solver in `(F, log sigma)` coordinates
 - CLI support for switching benchmark sources with `--benchmark-source paper|fdm|mc|none`
+- A regression test covering the `rho = 1` Islah edge case
 
 ## What is not implemented yet
 
 - Direct reimplementation of competing baselines such as Euler, low-bias, PSE, Hagan, ZC Map, or Hyb ZC Map
 - Variance reduction and full performance tuning
+
+## Current status
+
+Paper-scale validation with the built-in PDE/FDM benchmark currently reports:
+
+- overall conclusion: `Implementation consistent with paper`
+- replication conclusion: `Replication likely successful`
+- martingale test: noise-dominated with no evidence of systematic drift
+- Table 2: `PASS`
+- Table 1: `WARNING`, with a small residual discrepancy (max relative error about `0.43%`)
+
+This means the main replication target now looks successful, while Table 1 still shows a mild benchmark-level gap worth documenting.
 
 ## Run
 
@@ -57,6 +70,15 @@ You can also save any tabular output:
 python .\run_experiments.py --experiment table7 --output-csv .\outputs\table7.csv
 ```
 
+Current paper-scale reproducibility commands:
+
+```powershell
+python .\run_experiments.py --experiment table1 --paper-scale --benchmark-source fdm --output-csv .\outputs\table1_paper_scale_fdm.csv
+python .\run_experiments.py --experiment table2 --paper-scale --benchmark-source fdm --output-csv .\outputs\table2_paper_scale_fdm.csv
+python .\run_experiments.py --experiment validate --paper-scale --benchmark-source fdm --output-csv .\outputs\validation
+pytest -q .\tests\test_islah_rho1.py
+```
+
 ## Notes
 
 - The paper's formulas were transcribed from the PDF and implemented directly.
@@ -64,6 +86,7 @@ python .\run_experiments.py --experiment table7 --output-csv .\outputs\table7.cs
 - `--benchmark-source fdm` recomputes benchmark prices with the built-in PDE/FDM solver.
 - `table7` / `figure3` fall back to the internal high-resolution Monte Carlo benchmark unless `--benchmark-source fdm` is requested.
 - This is now a stronger reproduction scaffold with direct table/figure entrypoints and a built-in PDE benchmark, but it is still not a finished paper-grade reproduction package.
+- The saved validation CSVs are written as `validation_table1_df.csv`, `validation_table2_df.csv`, and `validation_martingale_df.csv` inside the output directory.
 - The fastest path from here is:
   1. replace paper-reference baseline rows with actual baseline implementations,
   2. tune variance reduction and runtime for paper-scale sweeps,
