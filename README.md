@@ -1,6 +1,6 @@
-# Replication Starter for 2408.01898v2
+# SABR Simulation Paper Replication
 
-This workspace contains a minimal Python replication scaffold for:
+This workspace contains a Python replication scaffold for:
 
 Choi, Hu, Kwok, "Efficient and accurate simulation of the stochastic-alpha-beta-rho model"
 
@@ -11,10 +11,101 @@ The current scaffold focuses on reproducing the paper's core Monte Carlo machine
 - Algorithm 3: exact sampling of a CEV transition via a shifted-Poisson mixture gamma law
 - Algorithm 4: full SABR terminal simulation over a time grid
 
+## Presentation overview
+
+The paper studies efficient Monte Carlo simulation of the SABR model
+
+```math
+dF_t = \sigma_t F_t^\beta\,dW_t,\qquad
+\frac{d\sigma_t}{\sigma_t} = \nu\,dZ_t,\qquad
+dW_t\,dZ_t = \rho\,dt.
+```
+
+The volatility step is sampled exactly:
+
+```math
+\sigma_{t+h}
+=
+\sigma_t
+\exp\left(\nu\sqrt{h}\,X_\sigma-\frac{1}{2}\nu^2h\right),
+\qquad X_\sigma\sim N(0,1).
+```
+
+The first difficult quantity is the normalized conditional average variance
+
+```math
+I_t^h
+=
+\frac{1}{\sigma_t^2h}
+\int_t^{t+h}\sigma_s^2\,ds
+\;\Bigg|\;\sigma_{t+h}.
+```
+
+Algorithm 1 approximates this with a shifted lognormal random variable:
+
+```math
+I_t^h
+\approx
+\mu
+\left[
+\frac{1}{6}
++
+\frac{5}{6}
+\exp\left(aX-\frac{1}{2}a^2\right)
+\right],
+\qquad X\sim N(0,1),
+```
+
+where
+
+```math
+\mu=\mathbb{E}[I_t^h\mid\sigma_{t+h}],\qquad
+a=\sqrt{\log\left(1+\frac{36}{25}v^2\right)},\qquad
+v=
+\frac{\sqrt{\operatorname{Var}(I_t^h\mid\sigma_{t+h})}}
+{\mathbb{E}[I_t^h\mid\sigma_{t+h}]}.
+```
+
+The second difficult quantity is the conditional forward price. For `0 < beta < 1`, Algorithm 2 uses a martingale-preserving CEV approximation:
+
+```math
+F_{t+h}\mid\sigma_{t+h},I_t^h
+\approx
+\operatorname{CEV}_\beta
+\left(
+\bar F_t^h,
+(\rho^*)^2\sigma_t^2hI_t^h
+\right),
+\qquad
+\rho^*=\sqrt{1-\rho^2},
+```
+
+with conditional mean
+
+```math
+\bar F_t^h
+=
+F_t
+\exp\left(
+\frac{\rho(\sigma_{t+h}-\sigma_t)}{\nu F_t^{1-\beta}}
+-
+\frac{\rho^2\sigma_t^2hI_t^h}{2F_t^{2(1-\beta)}}
+\right).
+```
+
+This choice is designed so that the forward process remains close to a martingale:
+
+```math
+\mathbb{E}[F_{t+h}]\approx F_t.
+```
+
+Algorithm 3 then samples the CEV transition exactly using a Gamma-Poisson-Gamma construction. Algorithm 4 combines the steps: exact volatility step, shifted-lognormal average variance, martingale-preserving CEV approximation, exact CEV sampling, and repetition over the full time grid.
+
 ## Files
 
 - `sabr_replicate.py`: core implementation
 - `run_experiments.py`: CLI entrypoint for tables, figures, and validation
+- `notebooks/paper_reproduction_walkthrough.ipynb`: presentation-oriented walkthrough with formulas, sanity checks, paper tables, figure datasets, and validation
 - `notebooks/replication_sanity_checks.ipynb`: notebook with model-level sanity checks and validation summaries
 - `requirements.txt`: lightweight dependency list for the replication environment
 
@@ -96,6 +187,12 @@ pytest -q .\tests\test_islah_rho1.py
 For an explanation-oriented walkthrough rather than a test log, open:
 
 ```text
+.\notebooks\paper_reproduction_walkthrough.ipynb
+```
+
+For a shorter sanity-check-only notebook, open:
+
+```text
 .\notebooks\replication_sanity_checks.ipynb
 ```
 
@@ -103,6 +200,7 @@ For an explanation-oriented walkthrough rather than a test log, open:
 
 - The paper's formulas were transcribed from the PDF and implemented directly.
 - We now rely on [PyFENG](https://pyfeng.readthedocs.io/en/latest/) for building blocks it already exposes well: conditional average-variance moments, shifted-lognormal moment fitting, and several analytic SABR approximation models.
+- The project directly reproduces the paper's proposed simulation method. Several competing baseline rows are included from PyFeng or paper-reference values rather than being fully reimplemented from scratch.
 - `--benchmark-source paper` uses the tabulated paper benchmarks when they are available.
 - `--benchmark-source fdm` recomputes benchmark prices with the built-in PDE/FDM solver.
 - `table7` / `figure3` fall back to the internal high-resolution Monte Carlo benchmark unless `--benchmark-source fdm` is requested.
