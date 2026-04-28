@@ -202,6 +202,7 @@ For the path-dependent Asian option extension, open:
 
 ```text
 .\notebooks\asian_option_extension.ipynb
+```
 
 ## Notes
 
